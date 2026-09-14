@@ -99,5 +99,20 @@ module.exports = function createFileCredentialStore({ protect, unprotect }) {
     return fs.existsSync(CREDS_FILE);
   }
 
-  return { readToken, writeToken, readAccount, writeAccount, hasAccount };
+  // ===== 登出:清除本工具的全部本地凭据 =====
+  // 只删本工具的两个文件(文件形态平台的所有秘密都在这),返回清除清单;
+  // 不触碰状态目录里的锁/瞬态文件(与凭据无关),也不删目录本身。
+  // 本机清除 ≠ 远端会话撤销:学校侧登录状态活到自然过期,由调用方说明
+  function clearAll() {
+    const cleared = [];
+    for (const file of [TOKEN_FILE, CREDS_FILE]) {
+      try {
+        fs.unlinkSync(file);
+        cleared.push(file);
+      } catch (e) { /* 不存在:无需清除 */ }
+    }
+    return cleared;
+  }
+
+  return { readToken, writeToken, readAccount, writeAccount, hasAccount, clearAll };
 };

@@ -20,6 +20,11 @@ process.env.MADMODEL_STATE_DIR = STATE_DIR;
 const TOKEN_FILE = path.join(STATE_DIR, 'token.json');
 fs.writeFileSync(TOKEN_FILE, JSON.stringify({ token: 'it-test-token', expiresAt: Date.now() + 3600e3 }));
 process.env.PROXY_TOKEN_FILE = TOKEN_FILE;
+// A1 等待重试的预算压到 2s(测试时限;默认 30s 见 config.waitRetryBudgetMs)。
+// MADMODEL_FORCE_TUNNEL_MODE:mock 上游不是隧道前缀,但等待重试路径按
+// 隧道形态验证(生产中该路径只在默认隧道上游下可达)
+process.env.PROXY_RETRY_WAIT_MS = '2000';
+process.env.MADMODEL_FORCE_TUNNEL_MODE = '1';
 
 const test = require('node:test');
 const assert = require('node:assert');
@@ -73,8 +78,10 @@ test('上游错误判定集成矩阵(mock 上游 + 完整代理实例)', async t
   const { createHttpServer, createTokenCache, createTokenState } = require('../adapters/http-server');
   const getToken = createTokenCache(config);
   const tokenState = createTokenState(getToken);
+  const { createCredentialWaiter } = require('../adapters/http-server');
   const service = createProxyService({
     config, tokenState, upstreamClient: createUpstreamClient(config),
+    waitForCredentials: createCredentialWaiter(getToken),
   });
   const httpServer = createHttpServer({ config, service, getToken });
   await new Promise(res => httpServer.server.listen(port, '127.0.0.1', res));
@@ -159,6 +166,66 @@ test('上游错误判定集成矩阵(mock 上游 + 完整代理实例)', async t
       const r = await chat(false);
       assert.strictEqual(r.status, 502);
       assert.ok(r.json.error.message.includes('截断'));
+    });
+
+    // ---- A1 等待重试(确认的 WebVPN 会话失效 → 等重签 → 重试一次) ----
+    // 模拟"重签":测试中途原子替换 token 文件(与 watch 重签同形态)
+    const swapToken = (token, cookie) => {
+      const tmp = TOKEN_FILE + '.swap.tmp';
+      fs.writeFileSync(tmp, JSON.stringify({ token, cookie, expiresAt: Date.now() + 3600e3 }));
+      fs.renameSync(tmp, TOKEN_FILE);
+    };
+
+    await t.test('A1 重试: 首次 302 + 凭据更换 → 重试成功,客户端无感', async () => {
+      const seenAuth = [];
+      mock.set((req, res) => {
+        seenAuth.push(req.headers.authorization);
+        if (seenAuth.length === 1) { res.writeHead(302, { location: '/login' }); res.end(); return; }
+        sse(res, [JSON.stringify(CH), JSON.stringify(USAGE)]);
+      });
+      const p = chat(false); // 发起后 ~600ms 模拟 watch 重签完成
+      await new Promise(r => setTimeout(r, 600));
+      swapToken('it-test-token-2');
+      const r = await p;
+      assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+      assert.strictEqual(r.json.choices?.[0]?.message?.content, 'ok');
+      assert.strictEqual(seenAuth.length, 2, '应恰好两次上游请求');
+      assert.ok(seenAuth[1].includes('it-test-token-2'), '重试应携带新凭据');
+    });
+
+    await t.test('A1 指纹: token 不变仅 cookie 更新 → 组合指纹仍视为变化并重试', async () => {
+      // 前一用例结束后 token 是 it-test-token-2:此用例保持该 token、只换 cookie,
+      // 真正走到"单比 token 不够、组合才够"的分支
+      let n = 0;
+      mock.set((req, res) => {
+        n++;
+        if (n === 1) { res.writeHead(302, { location: '/login' }); res.end(); return; }
+        sse(res, [JSON.stringify(CH), JSON.stringify(USAGE)]);
+      });
+      const p = chat(false);
+      await new Promise(r => setTimeout(r, 600));
+      swapToken('it-test-token-2', 'cookie-only-change');
+      const r = await p;
+      assert.strictEqual(r.status, 200);
+    });
+
+    await t.test('A1 上限: 连续两次 302 → 停止重试,交付"凭据仍被拒"文案', async () => {
+      mock.set((req, res) => { res.writeHead(302, { location: '/login' }); res.end(); });
+      const p = chat(false);
+      await new Promise(r => setTimeout(r, 600));
+      swapToken('it-test-token-4');
+      const r = await p;
+      assert.strictEqual(r.status, 502);
+      assert.ok(r.json.error.message.includes('仍被拒绝'), r.json.error.message);
+    });
+
+    await t.test('A1 超时: 等待预算内未见新凭据 → 交付等待预算文案(2s 预算)', async () => {
+      mock.set((req, res) => { res.writeHead(302, { location: '/login' }); res.end(); });
+      const t0 = Date.now();
+      const r = await chat(false);
+      assert.strictEqual(r.status, 502);
+      assert.ok(r.json.error.message.includes('等待预算'), r.json.error.message);
+      assert.ok(Date.now() - t0 >= 1800, `应在预算附近返回,实际 ${Date.now() - t0}ms`);
     });
   } finally {
     await new Promise(r => httpServer.server.close(r));

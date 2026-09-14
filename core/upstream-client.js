@@ -143,7 +143,12 @@ function createUpstreamClient(config) {
           let obj = null;
           try { obj = JSON.parse(text); } catch (e) { /* HTML 错误页等:按 body=null 带回原文 */ }
           cancelBody();
-          return finish({ type: 'upstream-error', status: up.status, body: obj, raw: text.slice(0, 500) });
+          // location 一并带回:302 → /login 是 WebVPN 会话失效的确认签名
+          // (proxy-service 的等待重试据此判定),直连门禁的 307 指向 oauth 不含
+          return finish({
+            type: 'upstream-error', status: up.status, body: obj,
+            raw: text.slice(0, 500), location: up.headers.get('location'),
+          });
         }
         const isSse = /event-stream/i.test(up.headers.get('content-type') || '');
         if (onOpen) onOpen(isSse);

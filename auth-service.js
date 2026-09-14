@@ -95,6 +95,40 @@ function stamp() {
   return new Date().toTimeString().slice(0, 8);
 }
 
+// 登出:清除本工具保存的全部本地凭据(密码/token/隧道会话)。
+// 前置:服务必须已停——运行中的代理持有 token 缓存(读失败时回退旧值),
+// 运行中的 watch 会把清掉的凭据重新写回,清除即被架空。首版(1.9.0)
+// 只支持停服后清理,不做代停(进程身份确认与停止顺序的复杂度留给真实
+// 需要时)。远端不撤销:学校侧登录状态活到自然过期(约 6 小时)
+async function logout() {
+  // ① 代理在跑?(/v1/models 健康探测,与 start.cmd 同一判定)
+  try {
+    const r = await fetch(`http://127.0.0.1:${config.port}/v1/models`, { signal: AbortSignal.timeout(2000) });
+    const j = await r.json().catch(() => null);
+    if (r.status === 200 && Array.isArray(j?.data)) {
+      throw new Error('代理仍在运行。请先关闭 start.cmd 窗口(或 Ctrl+C),再执行 logout');
+    }
+  } catch (e) {
+    if (e.message.includes('logout')) throw e; // 自身的指引错误原样上抛
+    /* 探测失败 = 未运行,继续 */
+  }
+  // ② watch 在跑?(锁 PID 探活)
+  try {
+    const lockPid = processLock.pidOf(fs.readFileSync(WATCH_LOCK, 'utf8'));
+    if (lockPid > 0 && processLock.isAlive(lockPid)) {
+      throw new Error(`watch 续期守护仍在运行(PID ${lockPid})。请先关闭 start.cmd 窗口,再执行 logout`);
+    }
+  } catch (e) {
+    if (e.message.includes('logout')) throw e;
+    /* 无锁文件 = 未运行,继续 */
+  }
+  // ③ 持认证锁清除(与 login/once 互斥,防进行中的续期写回)
+  return withAuthLock(() => {
+    const cleared = credentials.clearAll();
+    return { cleared };
+  });
+}
+
 // watch 守护:单实例锁 + 调度器装配。锁的争用与提示属 CLI 决策,留在本层
 let activeScheduler = null;
 async function watch() {
@@ -174,4 +208,4 @@ async function watch() {
   }
 }
 
-module.exports = { login, refresh, watch };
+module.exports = { login, refresh, watch, logout };

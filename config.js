@@ -32,7 +32,10 @@ const DEFAULT_UPSTREAM = `${MADMODEL_VPN_PREFIX}/v1/chat/completions`;
 // 校内直连或测试假上游时,既无隧道会话 cookie 可探,直连域门的 307 还会被
 // 误判为 invalid 触发无谓续期,故一律导出 null、保活整体禁用
 const upstreamUrl = process.env.PROXY_UPSTREAM || DEFAULT_UPSTREAM;
-const tunnelMode = upstreamUrl.startsWith(`${MADMODEL_VPN_PREFIX}/`);
+// tunnelMode 判定。MADMODEL_FORCE_TUNNEL_MODE=1 为测试注入口(集成测试的
+// mock 上游不是隧道前缀,但等待重试路径需按隧道形态验证),生产不设
+const tunnelMode = process.env.MADMODEL_FORCE_TUNNEL_MODE === '1' ||
+  upstreamUrl.startsWith(`${MADMODEL_VPN_PREFIX}/`);
 const keepaliveMatch = tunnelMode &&
   /^(.+\/)v1\/chat\/completions$/.exec(upstreamUrl);
 
@@ -96,6 +99,10 @@ module.exports = Object.freeze({
   // auth-service.watch / core/scheduler.js
   keepAliveIntervalMs: numberEnv('PROXY_KEEPALIVE_MS', 25 * 60 * 1000),
   keepaliveUrl: keepaliveMatch ? keepaliveMatch[1] + 'v1/models' : null,
+
+  // A1 等待重试的等待预算:确认的 WebVPN 会话失效(隧道 3xx)时,代理等
+  // watch 重签后重试一次,这里是等待上限(是预算不是恢复时间保证)
+  waitRetryBudgetMs: numberEnv('PROXY_RETRY_WAIT_MS', 30 * 1000),
 
   // HTTP server 调优
   maxConnections: 32,

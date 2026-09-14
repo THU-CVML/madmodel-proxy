@@ -68,3 +68,27 @@ test('坏记录/解不开:按"无数据"返回 null,不抛', () => {
   fs.writeFileSync(TOKEN_FILE, JSON.stringify({ v: 1, cipher: 'garbage', expiresAt: 1 }));
   assert.strictEqual(throwingStore.readToken(), null);
 });
+
+// ---- clearAll(登出):只删两个凭据文件,其余一概不动 ----
+test('clearAll: 删除 token 与 creds 文件,凭据读取归空', () => {
+  store.writeToken('tok-x', 999, 'cookie-x');
+  store.writeAccount('u1', 'pw', 'fp1');
+  const cleared = store.clearAll();
+  assert.strictEqual(cleared.length, 2);
+  assert.strictEqual(store.readToken(), null);
+  assert.strictEqual(store.readAccount(), null);
+  assert.strictEqual(store.hasAccount(), false);
+});
+
+test('clearAll: 无凭据时返回空清单,不抛', () => {
+  // 上一个用例已清空;再清一次应无操作
+  assert.deepStrictEqual(store.clearAll(), []);
+});
+
+test('clearAll: 只删凭据文件,不碰状态目录里的其他文件', () => {
+  const decoy = require('path').join(stateDir, 'watch.lock');
+  fs.writeFileSync(decoy, '12345');
+  store.writeToken('tok-y', 1);
+  store.clearAll();
+  assert.ok(fs.existsSync(decoy), '无关文件不应被删除');
+});

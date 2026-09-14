@@ -7,9 +7,12 @@
 'use strict';
 
 const { spawn } = require('child_process');
+const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
 const { checkForUpdate } = require('./core/update-check');
+const { classifyChildExit } = require('./core/child-supervision');
+const { TOKEN_FILE } = require('./platform/paths');
 const pkg = require('./package.json');
 
 const children = new Set();
@@ -22,6 +25,10 @@ let shuttingDown = false;
 // 实例在运行")不重启
 const crashStreaks = new Map();
 const givenUp = new Set();
+// 需人工等待恢复中的 tag(退出码 2 后等 login):收尾出口必须把它们计入
+// "仍有关切对象"——否则代理先死会把恢复轮询连同进程一起带走,用户此后
+// login 也无人拉起 watch
+const waitingRecovery = new Set();
 let pendingRestarts = 0; // 已排未触发的重启定时器数(spawn 失败收尾要避让它们)
 
 function launch(tag, script, args) {
@@ -57,7 +64,17 @@ function launch(tag, script, args) {
   child.on('exit', (code) => {
     children.delete(child);
     const ranMs = Date.now() - startedAt;
-    const intentional = code === 0 && ranMs < 30000;
+    const kind = classifyChildExit(code, ranMs);
+    if (kind === 'needs-human') {
+      // 退出码 2 = 需要人工处理(凭据失效/二次认证,cli 层协议)。停止重启,
+      // 给明确指引;watch 等 login 写入新凭据后自动恢复(轮询 token 文件
+      // mtime——watch 已死,唯一会动它的就是人工 login/once)
+      console.log(`[${tag}] === 需要人工处理(退出码 2),停止自动重启 ===`);
+      console.log(`[${tag}] 请重新登录: node refresh-token.js login(登录成功后自动恢复)`);
+      if (tag === 'watch') { waitingRecovery.add(tag); waitForRecovery(); }
+      return;
+    }
+    const intentional = kind === 'intentional';
     if (intentional) {
       console.log(`[${tag}] === 子进程正常退出(code 0,不重启)` +
         (children.size ? ',其余进程继续运行 ===' : ' ==='));
@@ -83,13 +100,35 @@ function launch(tag, script, args) {
       pendingRestarts++;
       setTimeout(() => { pendingRestarts--; if (!shuttingDown) launch(tag, script, args); }, 5000);
     }
-    // 没有存活/待重启的子进程时收尾(有定时器待重启则不退)
-    if (!children.size && (intentional || givenUp.has(tag))) {
+    // 没有存活/待重启/待恢复的子进程时收尾(有定时器待重启或有恢复等待
+    // 则不退——恢复轮询是本进程的持续关切)
+    if (!children.size && !waitingRecovery.size && (intentional || givenUp.has(tag))) {
       console.log('\n没有存活/待重启的子进程,窗口可关闭;需要时重开 start.cmd。');
       process.exit(givenUp.size ? 1 : 0);
     }
   });
   return child;
+}
+
+// 需人工状态下等待恢复:轮询 token 文件 mtime,变化即重新拉起 watch。
+// login/once 都会原子替换 token.json,变化必是人工动作(watch 已死,没有
+// 别的写者)。若新凭据仍无效,重启的 watch 会再次退出码 2,回到等待——
+// 循环安全。不设"已有子进程"守卫:代理还活着会让它误判;双拉起由 watch
+// 自身的单实例锁自愈(后来者退出码 0,dashboard 按正常退出处理)
+function waitForRecovery() {
+  let baseline = 0;
+  try { baseline = fs.statSync(TOKEN_FILE).mtimeMs; } catch (e) { /* 无 token 文件 */ }
+  const timer = setInterval(() => {
+    if (shuttingDown) { clearInterval(timer); waitingRecovery.delete('watch'); return; }
+    try {
+      if (fs.statSync(TOKEN_FILE).mtimeMs > baseline) {
+        clearInterval(timer);
+        waitingRecovery.delete('watch');
+        console.log('[watch] 检测到新凭据,自动恢复续期守护…');
+        launch('watch', 'refresh-token.js', ['watch']);
+      }
+    } catch (e) { /* 文件暂缺(写入窗口):继续等 */ }
+  }, 10000);
 }
 
 console.log('madmodel 单窗口模式:watch 续期守护 + 本地端点同窗运行');

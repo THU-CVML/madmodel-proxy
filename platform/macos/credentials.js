@@ -138,7 +138,29 @@ function hasAccount() {
   return readAccount() !== null;
 }
 
+// ===== 登出:清除本工具的全部本地凭据 =====
+// 钥匙串三条目(密码/token/webvpn 会话 cookie)逐一删除,再删两个元数据
+// 文件;返回清除清单。只操作本工具的条目与文件,不触碰任何其他钥匙串
+// 内容。本机清除 ≠ 远端会话撤销:学校侧登录状态活到自然过期
+function clearAll() {
+  const cleared = [];
+  for (const account of [ACCOUNT_PASSWORD, ACCOUNT_TOKEN, ACCOUNT_COOKIE]) {
+    try {
+      execFileSync('security', ['delete-generic-password', '-s', SERVICE, '-a', account],
+        { stdio: ['ignore', 'ignore', 'ignore'] });
+      cleared.push(`钥匙串:${account}`);
+    } catch (e) { /* 条目不存在:无需清除 */ }
+  }
+  for (const file of [TOKEN_FILE, CREDS_FILE]) {
+    try {
+      fs.unlinkSync(file);
+      cleared.push(file);
+    } catch (e) { /* 不存在:无需清除 */ }
+  }
+  return cleared;
+}
+
 module.exports = {
   readToken, writeToken,
-  readAccount, writeAccount, hasAccount,
+  readAccount, writeAccount, hasAccount, clearAll,
 };

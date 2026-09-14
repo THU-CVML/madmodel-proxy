@@ -169,6 +169,22 @@ async function main() {
     } catch (e) { bad('哨兵复核', e); }
   }
 
+  // ---- 1c) 登出清除:clearAll 移除全部凭据,且只动测试命名空间 ----
+  try {
+    const cleared = credentials.clearAll();
+    assert(cleared.length >= 2, 'clearAll 应至少清除 token 与账号文件');
+    assert(credentials.readToken() === null, '清除后 readToken 应为 null');
+    assert(credentials.readAccount() === null, '清除后 readAccount 应为 null');
+    assert(credentials.hasAccount() === false, '清除后 hasAccount 应为 false');
+    if (process.platform === 'darwin') {
+      assert(secRead(KC_TEST_SERVICE, 'password') === null, '清除后钥匙串 password 条目应不存在');
+      assert(secRead(KC_TEST_SERVICE, 'token') === null, '清除后钥匙串 token 条目应不存在');
+      assert(secRead(KC_TEST_SERVICE, 'webvpn-cookie') === null, '清除后钥匙串 cookie 条目应不存在');
+      assert(secRead(KC_SENTINEL_SERVICE, 'password') === 'sentinel-v0', 'clearAll 不得触碰哨兵命名空间');
+    }
+    ok('登出清除(全凭据移除,仅限测试命名空间)');
+  } catch (e) { bad('登出清除', e); }
+
   // ---- 2) proxy 无 token 场景启动并应答 /v1/models ----
   let proxy;
   try {
@@ -190,9 +206,8 @@ async function main() {
   if (proxy) await stop(proxy);
 
   // ---- 3) watch 守护的调度循环 ----
-  // 状态目录里有第 1 步写入的有效 token:守护会打印"token 有效至…等待续期窗口"
-  // (顺带验证了跨进程的存储解密——生产形态正是 watch 写、其他进程读);
-  // 若无凭据则是"尚未配置凭据"。两种心跳都证明锁/唤醒/调度器装配成功
+  // 1c 已清除凭据:守护打印"尚未配置凭据"(该心跳证明锁/唤醒/调度器装配
+  // 成功;token 有效性路径由 1a 的跨进程读回覆盖)
   let watch;
   try {
     watch = spawn(process.execPath, [path.join(ROOT, 'refresh-token.js'), 'watch'], { env });

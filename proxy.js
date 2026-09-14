@@ -27,6 +27,7 @@ const { createHttpServer, createTokenCache, createTokenState } = require('./adap
 const { getTokenizer } = require('./core/tokenizer');
 const paths = require('./platform/paths');
 const { atomicWrite } = require('./platform/file-store');
+const { createCredentialWaiter } = require('./adapters/http-server');
 
 // 隧道会话失效的快速自愈:代理遇隧道 3xx(会话被拒)时写 revive 标志,watch
 // 的目录监听唤醒后立即探活重签——网络切换后 WebVPN 会话绑定失效的场景,
@@ -53,6 +54,9 @@ const service = createProxyService({
   tokenState,
   upstreamClient: createUpstreamClient(config),
   onTunnelAuthLost: notifyTunnelAuthLost,
+  // A1 等待重试:凭据等待器轮询 token 缓存(mtime 失效,watch 重签原子
+  // 替换后即见新值),凭据指纹为 token+cookie 组合
+  waitForCredentials: createCredentialWaiter(getToken),
 });
 const httpServer = createHttpServer({ config, service, getToken });
 

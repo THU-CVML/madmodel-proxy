@@ -169,6 +169,28 @@ function createTokenState(getToken) {
   };
 }
 
+// 凭据等待器(A1 等待重试的注入原语):轮询 token 缓存(mtime 失效,续期
+// 进程原子替换后即返回新值),直到凭据组合(token+cookie)与失败请求所用
+// 的那份不同、或预算耗尽。凭据指纹是组合而非单 token:WebVPN 恢复可能
+// 只更新 cookie 而 JWT 不变,单比 token 会白等到超时。不带 per-request
+// signal:调用方在 resolve 后自查客户端取消(个别断开不应中止共享等待)
+function createCredentialWaiter(getToken) {
+  return async function waitForCredentials(usedToken, usedCookie, budgetMs) {
+    const deadline = Date.now() + budgetMs;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 500));
+      try {
+        const t = getToken();
+        if (t && t.token &&
+            (t.token !== usedToken || (t.cookie || '') !== (usedCookie || ''))) {
+          return t;
+        }
+      } catch (e) { /* 读取瞬态失败(写入窗口):继续等 */ }
+    }
+    return null;
+  };
+}
+
 function createHttpServer({ config, service, getToken }) {
   const allowedHosts = new Set([
     `127.0.0.1:${config.port}`, `localhost:${config.port}`, `[::1]:${config.port}`,
@@ -381,4 +403,4 @@ function createHttpServer({ config, service, getToken }) {
   };
 }
 
-module.exports = { createHttpServer, createTokenCache, createTokenState };
+module.exports = { createHttpServer, createTokenCache, createTokenState, createCredentialWaiter };

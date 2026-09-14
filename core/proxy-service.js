@@ -37,7 +37,7 @@ function busyHint(payload, config) {
 }
 
 function createProxyService(deps) {
-  const { config, tokenState, upstreamClient, onTunnelAuthLost } = deps;
+  const { config, tokenState, upstreamClient, onTunnelAuthLost, waitForCredentials } = deps;
   // 活跃上游请求数(进程保护,见 handleRequest 的 inflight 硬上限)
   let inflight = 0;
 
@@ -201,18 +201,83 @@ function createProxyService(deps) {
     // (proxy-panic 日志),已发出则只结束连接、不写任何新响应。
     // 客户端断开/聚合超时复用同一个 abort signal(adapter 建)
     const ac = ctx.abortController;
-    inflight++;
+    // inflight 的释放幂等化:等待重试期间没有上游请求在飞,应释放槽位
+    // (一场切网的多路并发等待不能占满 64 上限),重试时再占用
+    let inflightHeld = false;
+    const hold = () => { if (!inflightHeld) { inflightHeld = true; inflight++; } };
+    const release = () => { if (inflightHeld) { inflightHeld = false; inflight--; } };
+    hold();
     try {
-      if (clientWantsStream) return await streamPassthrough(ctx, payload, auth, extraHeaders, gateNote, ac);
-      return await aggregateResponse(ctx, payload, auth, extraHeaders, gateNote, ac);
+      const attempt = a => clientWantsStream
+        ? streamPassthrough(ctx, payload, a, extraHeaders, gateNote, ac)
+        : aggregateResponse(ctx, payload, a, extraHeaders, gateNote, ac);
+      let r = await attempt(auth);
+      // A1 等待重试:确认的 WebVPN 会话失效(3xx 且 Location 指向登录页,
+      // 头未发出——attempt 以 {retryAuth} 交回,未交付任何响应)。可等待
+      // (隧道形态且注入了等待器)则走等待重试;不可等待的形态就地交付
+      // 会话失效错误,绝不能带着未交付的响应返回。
+      // 等待流程:revive 标志已写出,watch 秒级重签;等凭据组合(token+
+      // cookie)变化后重试一次——用户从"切网后第一句必失败"变成"第一句
+      // 慢几秒"。五条件:仅确认的会话失效重定向、凭据指纹为组合、变化后
+      // 即重试、最多一次、等待不占上游槽位且各请求在结果后自查客户端
+      // 取消;已生成内容(头已发)或不明失败不在此路径。预算(默认 30s)
+      // 是等待上限非恢复保证
+      if (r && r.retryAuth) {
+        if (config.tunnelMode && deps.waitForCredentials) {
+          release(); // 等待期间无上游请求,不占并发槽
+          const fresh = await sharedCredentialWait(auth.token, auth.cookie);
+          if (ctx.clientGone()) return;
+          if (fresh) {
+            hold();
+            logReq(ctx.req, 100, ctx.started, ctx.size, `auth-retry:凭据已更新,重试一次`);
+            const a2 = { token: fresh.token, cookie: fresh.cookie };
+            const r2 = await attempt(a2);
+            if (!(r2 && r2.retryAuth)) return; // 重试已交付响应(成功或错误)
+            // 重试仍是会话失效:新凭据也过不了(登录态真死),快交付
+            logReq(ctx.req, 502, ctx.started, ctx.size, 'upstream-err 会话失效;重试仍失效');
+            return ctx.sendError(502,
+              'WebVPN 会话已失效,且更新后的凭据仍被拒绝(登录态可能已过期)。请稍后重试;持续出现请运行 node refresh-token.js login。',
+              'upstream_error', extraHeaders);
+          }
+          logReq(ctx.req, 502, ctx.started, ctx.size,
+            `upstream-err 会话失效;${Math.round(config.waitRetryBudgetMs / 1000)}s 内未见新凭据`);
+          return ctx.sendError(502,
+            `WebVPN 会话已失效(上游 302 跳转登录页)。自动重签未在 ${Math.round(config.waitRetryBudgetMs / 1000)} 秒等待预算内完成,请稍后重试;持续出现请确认 watch 守护在运行。`,
+            'upstream_error', extraHeaders);
+        }
+        // 非隧道形态出现登录重定向(理论不该发生):快交付,不空等
+        if (ctx.clientGone()) return;
+        logReq(ctx.req, 502, ctx.started, ctx.size, 'upstream-err 会话失效(非隧道形态的登录重定向)');
+        return ctx.sendError(502,
+          '上游以登录重定向拒绝请求(会话失效形态)。请稍后重试;持续出现请确认配置。',
+          'upstream_error', extraHeaders);
+      }
+      return r;
     } finally {
-      // 唯一释放路径:早退(400/413/429)发生在 inflight++ 之前,不经过这里
-      inflight--;
+      release();
     }
   }
 
+  // 同一场会话失效的等待去重:同一凭据指纹(token+cookie)的多个并发请求
+  // 共享一个轮询——首个进入者等待,其余 await 同一 Promise,凭据变化一次
+  // 性唤醒全部(64 路子代理编排是本工具主场景,不去重则一场切网的等待
+  // 轮询 ×64)。等待不带 per-request signal:个别客户端断开不应中止他人
+  // 的等待,断开方在 resolve 后自查 clientGone 静默返回
+  let inflightWait = null; // { key, promise }
+  function sharedCredentialWait(usedToken, usedCookie) {
+    const key = `${usedToken}\u0000${usedCookie || ''}`;
+    if (!inflightWait || inflightWait.key !== key) {
+      const promise = deps.waitForCredentials(usedToken, usedCookie, config.waitRetryBudgetMs)
+        .finally(() => { if (inflightWait && inflightWait.key === key) inflightWait = null; });
+      inflightWait = { key, promise };
+    }
+    return inflightWait.promise;
+  }
+
   // ---- 流式透传 ----
-  // auth: { token, cookie } —— cookie 为 WebVPN 隧道会话凭证,可缺省
+  // auth: { token, cookie } —— cookie 为 WebVPN 隧道会话凭证,可缺省。
+  // 确认的隧道会话失效(3xx + /login)以 {retryAuth} 交回调用方,交付决策
+  // (等待重试/快失败/重试仍失效)全部在 handleRequest 收敛
   async function streamPassthrough(ctx, payload, auth, extraHeaders, normNote, ac) {
     const { req, started, size } = ctx;
     const result = await upstreamClient.request({
@@ -233,6 +298,16 @@ function createProxyService(deps) {
     }
     if (result.type === 'upstream-error') {
       reportTunnelAuthLost(result);
+      // A1 等待重试:确认的 WebVPN 会话失效——3xx 且 Location 指向登录页
+      // (实测隧道签名为 302 → /login;直连门禁 307 指向 oauth 不含 /login,
+      // 不会误入)。头未发出时一律以 {retryAuth} 交回调用方,不内联交付
+      // ——交付决策(等待重试/快失败/重试仍失效)全部在 handleRequest
+      // 收敛,避免调用方与交付方分裂;revive 标志已由 reportTunnelAuthLost 写出
+      if (!ctx.sseHeadersSent() &&
+          result.status >= 300 && result.status < 400 &&
+          String(result.location || '').includes('/login')) {
+        return { retryAuth: true };
+      }
       if (!ctx.sseHeadersSent()) {
         ctx.dumpFailed();
         const mapped = translateUpstreamError(result.body, result.raw, result.status, busyHint(payload, config));
@@ -346,6 +421,13 @@ function createProxyService(deps) {
     }
     if (result.type === 'upstream-error') {
       reportTunnelAuthLost(result);
+      // A1 等待重试(与流式路径同判定):确认的登录重定向(3xx + /login)
+      // 一律交回调用方,不内联交付(见流式路径注释)
+      if (!ctx.sseHeadersSent() &&
+          result.status >= 300 && result.status < 400 &&
+          String(result.location || '').includes('/login')) {
+        return { retryAuth: true };
+      }
       ctx.dumpFailed();
       const mapped = translateUpstreamError(result.body, result.raw, result.status, busyHint(payload, config));
       logReq(req, mapped.http, started, size,

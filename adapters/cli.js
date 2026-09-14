@@ -8,7 +8,7 @@
 
 const fs = require('fs');
 const readline = require('readline');
-const { login, refresh, watch } = require('../auth-service');
+const { login, refresh, watch, logout } = require('../auth-service');
 const credentials = require('../platform/credentials');
 const processLock = require('../platform/process-lock');
 const config = require('../config');
@@ -117,21 +117,72 @@ async function cmdStatus() {
   console.log('凭据: ' + (credentials.hasAccount() ? '已配置' : '未配置(node refresh-token.js login)'));
 }
 
+// 登出:清除本机保存的全部凭据(密码/token/隧道会话)。TTY 下 y 确认,
+// 非 TTY(管道/脚本)需 --yes 显式确认。清除范围与"远端不撤销"的说明
+// 在执行前后各出现一次:确认前让用户知道要删什么,完成后交代边界
+async function cmdLogout(args) {
+  const confirmed = args.includes('--yes');
+  if (!confirmed) {
+    if (!process.stdin.isTTY) {
+      console.error('非交互环境需显式确认: node refresh-token.js logout --yes');
+      process.exit(1);
+    }
+    console.log('将清除本机保存的:统一认证密码、madmodel token、WebVPN 会话(钥匙串条目与加密文件)。');
+    console.log('学校侧的登录状态不受影响(活到自然过期);清除后需重新 login 才能续用。');
+    process.stdout.write('继续? [y/N] ');
+    const ok = await new Promise(resolve => {
+      process.stdin.setRawMode(true);
+      process.stdin.resume();
+      process.stdin.setEncoding('utf8');
+      const onData = ch => {
+        process.stdin.setRawMode(false);
+        process.stdin.removeListener('data', onData);
+        process.stdin.pause();
+        process.stdout.write('\n');
+        if (ch === '\u0003') { console.error('已取消'); process.exit(130); } // Ctrl+C
+        resolve(ch);
+      };
+      process.stdin.once('data', onData);
+    });
+    if (ok !== 'y' && ok !== 'Y') { console.log('已取消'); return; }
+  }
+  const { cleared } = await logout();
+  if (!cleared.length) {
+    console.log('本机没有已保存的凭据,无需清除');
+    return;
+  }
+  for (const item of cleared) {
+    // 钥匙串条目原样展示;文件路径走 display 脱敏(不进日志的习惯延伸)
+    console.log(`已清除: ${item.startsWith('钥匙串:') ? item : display(item)}`);
+  }
+  console.log('本机凭据已全部清除(学校侧登录状态不受影响,活到自然过期)。');
+}
+
 async function runCli(argv) {
   const cmd = argv[0] || 'status';
   try {
     if (cmd === 'login') await cmdLogin();
     else if (cmd === 'once') await cmdOnce();
     else if (cmd === 'watch') await watch();
+    else if (cmd === 'logout') await cmdLogout(argv.slice(1));
     else if (cmd === 'status') await cmdStatus();
     else if (cmd === 'key') {
       console.log('代理本地无鉴权,已无 key 命令;客户端 API key 填任意值。');
     }
     else {
-      console.log('用法: node refresh-token.js [login|once|watch|status]');
+      console.log('用法: node refresh-token.js [login|once|watch|logout|status]');
       process.exit(1);
     }
   } catch (e) {
+    // 退出码协议:2 = 需要人工处理(凭据失效/要求二次认证),dashboard 据此
+    // 停止自动重启、提示重新 login,login 后自动恢复(见 dashboard.js)
+    if (e.code === 'BAD_CREDENTIALS' || e.code === 'TWO_FACTOR_REQUIRED') {
+      console.error(`❌ [${e.code}] ${e.message}`);
+      console.error(e.code === 'TWO_FACTOR_REQUIRED'
+        ? '登录链要求二次认证,需人工完成一次: node refresh-token.js login'
+        : '凭据已失效(如改过学校密码),需重新登录: node refresh-token.js login');
+      process.exit(2);
+    }
     console.error(`❌ ${e.code ? `[${e.code}] ` : ''}${e.message}`);
     process.exit(1);
   }

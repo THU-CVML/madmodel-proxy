@@ -666,13 +666,18 @@ class MadmodelAuthClient {
     if (json && json.object && json.object.roamingurl) {
       return this.mapRoamingUrl(json.object.roamingurl);
     }
-    // 无 roamingurl:门户会话缺失,强制重建后重试(实测验证的模式)
+    // 无 roamingurl:门户会话缺失,强制重建后重试(实测验证的模式)。
+    // 重建后必须重读 CSRF(1.9.0 前的缺陷:重建后 portalCsrf 仍为空,重试
+    // 携带空 _csrf 注定失败);读不到则明确报错,不发明知缺凭据的请求
     const keys = json ? Object.keys(json).join(',') : '非JSON';
     console.warn(`[thuInfo] ${label}漫游无跳转地址,重建会话后重试(响应键=${keys})`);
-    this.portalCsrf = '';
     await this.establishWebVpnSession(
       credentials.username, credentials.password, credentials.fingerPrint,
       credentials.twoFactorHandler);
+    this.portalCsrf = await this.readPortalCsrf();
+    if (!this.portalCsrf) {
+      throw AuthError(label + '会话重建后未取得 CSRF token', 'THUINFO_CSRF_EMPTY');
+    }
     body = await doRoam();
     try { json = JSON.parse(String(body || '')); } catch (e) {
       throw AuthError(label + '漫游返回非 JSON', 'THUINFO_NOT_JSON');
