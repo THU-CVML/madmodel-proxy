@@ -33,7 +33,16 @@ jobs:
       # 与 mock 上游集成测试(upstream-integration),零真实 I/O;
       # 协议行为(未知帧型/网关形态)不在此处——那是 smoke-real.js 的职责,
       # 有意不进 CI(访问真实校方服务并消耗配额)
+      # Node 18 规避:--test 的父进程 TAP 解析器对非 ASCII 测试名崩溃
+      # (ERR_TAP_LEXER_ERROR,实测 18.14.2;20/24 正常)。18.14 逐文件直跑,
+      # 无父进程解析,运行时行为同样完整验证;产品代码不含 node:test,
+      # 不受此 bug 影响
+      - name: Tests (per-file, Node 18 TAP bug workaround)
+        if: matrix.node == '18.14'
+        run: |
+          for f in test/*.test.js; do node "$f"; done
       - name: Tests
+        if: matrix.node != '18.14'
         run: node --test
 
   platform:
