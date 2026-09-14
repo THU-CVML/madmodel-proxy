@@ -114,3 +114,79 @@ test('分词: 同文本重复计数一致(缓存路径)', () => {
   const t = '缓存一致性检查'.repeat(10);
   assert.strictEqual(tk.countText(t), tk.countText(t));
 });
+
+// ---- 1.8.1 堆式 BPE 与旧实现(数组全扫描+splice)的差分等价验证 ----
+// 声明边界:本节验证的是"已覆盖输入上的等价性",不承诺捕获任何偏差;
+// 覆盖面为带种子的随机输入 + 显式同 rank 顺序用例。上游换分词器/改模板
+// 不在本测试检测范围(那需要重新跑 usage.prompt_tokens 对测)
+const { createTokenizer, _referenceBpe } = require('../core/tokenizer');
+const fsMod = require('fs');
+const pathMod = require('path');
+const modelJson = JSON.parse(fsMod.readFileSync(
+  pathMod.join(__dirname, '..', 'vendor', 'deepseek-tokenizer.json'), 'utf8'));
+const tkRef = createTokenizer(modelJson, { bpeImpl: _referenceBpe });
+
+// mulberry32:带种子的 PRNG,失败可复现
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+const CHAR_CLASSES = [
+  'abcdefghijklmnopqrstuvwxyz',
+  'ABCDEFGHJKLMNPQRSTUVWXYZ',
+  '0123456789',
+  '的一是在了有和人这中大为上个国',
+  '，。；：""（）',
+  ' \n\t',
+  '{}[]()<>/*+-=;#!?',
+];
+
+test('差分等价: 200 组带种子随机输入,新旧实现计数逐一相同', () => {
+  const rnd = mulberry32(20260914);
+  for (let iter = 0; iter < 200; iter++) {
+    const len = 1 + Math.floor(rnd() * 300);
+    let s = '';
+    for (let i = 0; i < len; i++) {
+      const cls = CHAR_CLASSES[Math.floor(rnd() * CHAR_CLASSES.length)];
+      s += cls[Math.floor(rnd() * cls.length)];
+    }
+    const a = tk.countText(s), b = tkRef.countText(s);
+    assert.strictEqual(a, b, `iter=${iter} len=${len} input=${JSON.stringify(s.slice(0, 60))}`);
+  }
+});
+
+test('差分等价: 同 rank 高频场景(重复字符/交替/长中文段)', () => {
+  const cases = [
+    'a'.repeat(500), 'ab'.repeat(250), 'aaaab', 'ababa',
+    '哈'.repeat(500), '你好'.repeat(250), '哈哈哈哈哈' + 'ok' + '哈哈哈哈',
+    'const x = 1; '.repeat(60),
+    'aaaa bbbb aaaa bbbb cccc',
+  ];
+  for (const s of cases) {
+    assert.strictEqual(tk.countText(s), tkRef.countText(s), JSON.stringify(s.slice(0, 30)));
+  }
+});
+
+// ---- 长输入:只验新实现(旧算法会拖死测试),钉值来自 1.8.1 改造前基线
+// (Node v24.11.1 同机,旧实现:a×8192=1024 / a×20480=2560 / 哈×3000=750 /
+// 哈×6000=1500)。时间上限留百倍余量,作为二次方回归探测器而非精确性能断言
+test('长输入: 同字符与无标点中文,计数与改造前基线一致且在时限内', () => {
+  const cases = [
+    ['a'.repeat(8192), 1024],
+    ['a'.repeat(20480), 2560],
+    ['哈'.repeat(3000), 750],
+    ['哈'.repeat(6000), 1500],
+  ];
+  for (const [s, expected] of cases) {
+    const t0 = Date.now();
+    const v = tk.countText(s);
+    const ms = Date.now() - t0;
+    assert.strictEqual(v, expected, `len=${s.length}`);
+    assert.ok(ms < 3000, `len=${s.length} 耗时 ${ms}ms 超上限(疑似二次方回归)`);
+  }
+});

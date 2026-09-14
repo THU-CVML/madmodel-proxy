@@ -21,7 +21,11 @@ const { generateFingerprint } = require('../../madmodel-auth');
 const { atomicWrite } = require('../file-store');
 const { TOKEN_FILE, CREDS_FILE } = require('../paths');
 
-const SERVICE = 'madmodel-proxy';
+// 钥匙串 service 名可经 MADMODEL_KEYCHAIN_SERVICE 覆盖:测试隔离用(冒烟/
+// 集成测试注入独立命名空间,与生产条目完全隔离——1.8.1 前冒烟与生产共用
+// service 名,在已配置的真机上跑测试会覆盖并清理掉真实凭据)。生产路径
+// 不设此变量,恒为默认名
+const SERVICE = process.env.MADMODEL_KEYCHAIN_SERVICE || 'madmodel-proxy';
 const ACCOUNT_PASSWORD = 'password';
 const ACCOUNT_TOKEN = 'token';
 // WebVPN 隧道会话 cookie:与 token 同级秘密(凭它可冒用整个 WebVPN 会话),

@@ -124,6 +124,27 @@ function createUpstreamClient(config) {
           signal: lifecycle.signal,
         });
         clearTimeout(headerTimer);
+        // 非 2xx 一律走错误翻译,不再按 content-type 决定路径(1.8.1):
+        // 实测复现过 500 + text/event-stream + 标准 error 对象帧的形态,旧
+        // 逻辑把它当正常流送进聚合器,下游收到 200 + content:null 的假成功。
+        // 本上游的合法应答恒为 200(直连实测),非 2xx 必是错误(网关 502/504
+        // HTML、302 登录跳转、307 门禁),读完有限 body 交给翻译层
+        if (!up.ok) {
+          armIdle();
+          let text;
+          try {
+            reader = up.body.getReader();
+            text = (await readLimited(reader, upstreamJsonBodyLimit)).toString('utf8');
+          } catch (e) {
+            cancelBody();
+            return finish({ type: 'network-error', cause: `上游错误响应读取失败: ${String(e?.message || e)}` });
+          }
+          if (settled) return;
+          let obj = null;
+          try { obj = JSON.parse(text); } catch (e) { /* HTML 错误页等:按 body=null 带回原文 */ }
+          cancelBody();
+          return finish({ type: 'upstream-error', status: up.status, body: obj, raw: text.slice(0, 500) });
+        }
         const isSse = /event-stream/i.test(up.headers.get('content-type') || '');
         if (onOpen) onOpen(isSse);
         upBody = up.body;
@@ -184,7 +205,15 @@ function createUpstreamClient(config) {
               return finish({ type: 'protocol-error', reason: 'invalid', message: event.message });
             }
             const obj = event.value;
-            if (obj && typeof obj === 'object' && obj.errorMessage !== undefined && !obj.choices) {
+            // 错误帧(200-SSE 内嵌形态):学校方言 errorMessage 与 OpenAI 标准
+            // error 对象都识别(1.8.1 前只认前者,标准形态被当正常 chunk 送进
+            // 聚合器,产出 200 + content:null 的假成功)。带 choices 属性的帧
+            // 即使另带错误字段也照常透传——以正常内容为准;注意 choices:[] 的
+            // usage 帧同样必须放行(空数组为 truthy,判据是属性存在而非长度),
+            // 若上游以 {error, choices:[]} 同帧返回则按内容处理(残余缝隙,
+            // 实测未见此形态)
+            if (obj && typeof obj === 'object' && !obj.choices &&
+                (obj.errorMessage !== undefined || (obj.error && typeof obj.error === 'object'))) {
               cancelBody();
               return finish({ type: 'upstream-error', status: up.status, body: obj, raw: JSON.stringify(obj).slice(0, 500) });
             }

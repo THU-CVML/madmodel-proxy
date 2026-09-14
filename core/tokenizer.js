@@ -34,7 +34,104 @@ function buildByteToUni() {
 const PIECE_CACHE_LIMIT = 65536;
 const TEXT_CACHE_CHARS = 8 * 1024 * 1024;
 
-function createTokenizer(model) {
+// ---- BPE 合并的实现(模块级,签名为 (piece, mergeRank, vocab) -> token 数) ----
+
+// 堆式实现(1.8.1 起的生产路径):链表 + 最小堆,整体 O(n log n)。
+// 正确性约束(与差分参照 _referenceBpe 对齐,验证见 test/tokenizer.test.js):
+//   - 每次合并取 merge rank 最小的相邻对,同 rank 取最左出现。堆排序键为
+//     (rank, 左节点票据),票据由存活的左节点继承,恒等于该节点最左成分
+//     字符的初始位置——链表顺序不变,小票据即靠左
+//   - rank 与 pair 字符串一一对应(mergeRank 是双射),弹出时重查
+//     rank 与相邻关系即可完成惰性失效校验(节点死亡/字符变/相邻变都拒)
+// 取代旧实现的原因:数组全扫描 + splice 最坏 O(n²),8KB 同字符实测
+// 1021ms、6,000 无标点中文 9305ms,同步阻塞整个代理事件循环
+function heapBpe(piece, mergeRank, vocab) {
+  const n = piece.length;
+  if (n < 2) return n === 1 && vocab.has(piece) ? 1 : 0;
+  // 链表:ch/prv/nxt 平行数组,下标即节点 id;左节点吸收右节点,故表头 0 永不死。
+  // 尾节点哨兵为 -1(nxt[n-1] = -1),计数遍历以 i !== -1 终止。
+  // alive 是失效校验的关键:被吸收的节点其 nxt/ch 都不会被改写,仅凭
+  // nxt[li]===ri 与 rank 复查无法识别死节点(实测在代码密集样本上翻车),
+  // 必须显式查存活
+  const ch = new Array(n), prv = new Array(n), nxt = new Array(n), ticket = new Array(n);
+  const alive = new Array(n).fill(true);
+  for (let i = 0; i < n; i++) { ch[i] = piece[i]; prv[i] = i - 1; nxt[i] = i + 1; ticket[i] = i; }
+  nxt[n - 1] = -1;
+  const heap = []; // 条目 [rank, 票据, 左id, 右id]
+  const lt = (a, b) => a[0] < b[0] || (a[0] === b[0] && a[1] < b[1]);
+  const hpush = e => {
+    heap.push(e);
+    let i = heap.length - 1;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (!lt(heap[i], heap[p])) break;
+      [heap[p], heap[i]] = [heap[i], heap[p]];
+      i = p;
+    }
+  };
+  const hpop = () => {
+    const top = heap[0], last = heap.pop();
+    if (heap.length) {
+      heap[0] = last;
+      let i = 0;
+      for (;;) {
+        const l = 2 * i + 1, r = l + 1;
+        let m = i;
+        if (l < heap.length && lt(heap[l], heap[m])) m = l;
+        if (r < heap.length && lt(heap[r], heap[m])) m = r;
+        if (m === i) break;
+        [heap[m], heap[i]] = [heap[i], heap[m]];
+        i = m;
+      }
+    }
+    return top;
+  };
+  for (let i = 0; i + 1 < n; i++) {
+    const r = mergeRank.get(ch[i] + ' ' + ch[i + 1]);
+    if (r !== undefined) hpush([r, i, i, i + 1]);
+  }
+  while (heap.length) {
+    const [rank, , li, ri] = hpop();
+    if (!alive[li] || !alive[ri] || nxt[li] !== ri) continue; // 惰性失效:死节点或相邻关系已变
+    if (mergeRank.get(ch[li] + ' ' + ch[ri]) !== rank) continue; // 左字符已变
+    ch[li] += ch[ri];
+    alive[ri] = false;
+    const after = nxt[ri];
+    nxt[li] = after;
+    if (after !== -1) prv[after] = li;
+    const p = prv[li];
+    if (p !== -1) {
+      const r = mergeRank.get(ch[p] + ' ' + ch[li]);
+      if (r !== undefined) hpush([r, ticket[p], p, li]);
+    }
+    if (after !== -1) {
+      const r = mergeRank.get(ch[li] + ' ' + ch[after]);
+      if (r !== undefined) hpush([r, ticket[li], li, after]);
+    }
+  }
+  let c = 0;
+  for (let i = 0; i !== -1; i = nxt[i]) if (vocab.has(ch[i])) c += 1;
+  return c;
+}
+
+// 差分测试参照:1.8.1 之前的实现(数组全扫描 + splice,最坏 O(n²))。
+// 仅供 test/tokenizer.test.js 注入 createTokenizer 做等价性对照,
+// 生产路径不得使用
+function _referenceBpe(piece, mergeRank, vocab) {
+  const parts = Array.from(piece);
+  while (parts.length >= 2) {
+    let bestRank = Infinity, bestIdx = -1;
+    for (let i = 0; i + 1 < parts.length; i++) {
+      const r = mergeRank.get(parts[i] + ' ' + parts[i + 1]);
+      if (r !== undefined && r < bestRank) { bestRank = r; bestIdx = i; }
+    }
+    if (bestIdx < 0) break;
+    parts.splice(bestIdx, 2, parts[bestIdx] + parts[bestIdx + 1]);
+  }
+  return parts.filter(p => vocab.has(p)).length;
+}
+
+function createTokenizer(model, opts = {}) {
   const byteToUni = buildByteToUni();
   const mergeRank = new Map(); // "a b"(byte-level 字符对) -> 合并优先级
   model.model.merges.forEach((m, i) => mergeRank.set(m, i));
@@ -61,20 +158,13 @@ function createTokenizer(model) {
   }
 
   const pieceCache = new Map(); // piece(byte-level 映射后) -> token 数
+  // BPE 实现可注入(opts.bpeImpl,签名 (piece, mergeRank, vocab) -> token 数):
+  // 默认堆式,测试注入 _referenceBpe(旧算法)做差分等价验证
+  const bpeImpl = typeof opts.bpeImpl === 'function' ? opts.bpeImpl : heapBpe;
   function bpeCount(piece) {
     let c = pieceCache.get(piece);
     if (c !== undefined) return c;
-    let parts = Array.from(piece);
-    while (parts.length >= 2) {
-      let bestRank = Infinity, bestIdx = -1;
-      for (let i = 0; i + 1 < parts.length; i++) {
-        const r = mergeRank.get(parts[i] + ' ' + parts[i + 1]);
-        if (r !== undefined && r < bestRank) { bestRank = r; bestIdx = i; }
-      }
-      if (bestIdx < 0) break;
-      parts.splice(bestIdx, 2, parts[bestIdx] + parts[bestIdx + 1]);
-    }
-    c = parts.filter(p => vocab.has(p)).length;
+    c = bpeImpl(piece, mergeRank, vocab);
     if (pieceCache.size >= PIECE_CACHE_LIMIT) {
       pieceCache.delete(pieceCache.keys().next().value);
     }
@@ -163,4 +253,4 @@ function getTokenizer() {
   return defaultTokenizer;
 }
 
-module.exports = { createTokenizer, getTokenizer };
+module.exports = { createTokenizer, getTokenizer, _referenceBpe };

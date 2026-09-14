@@ -14,6 +14,12 @@ function translateUpstreamError(bodyObj, raw, status, busyHint) {
   if (status === 401 || status === 403) {
     return { http: 401, message: '认证失败(token 无效或被拒绝)。请确认 watch 守护进程在运行: node refresh-token.js watch' };
   }
+  // 隧道会话失效的实测形态:302 → /login,响应体为空。1.8.1 前落到兜底的
+  // "无法识别的响应(空)"(2026-09-12 事故),用户无从知道该重试。会话由
+  // watch 自动重签(1.7.2 起秒级自愈),稍后重试即恢复
+  if (status === 301 || status === 302) {
+    return { http: 502, message: 'WebVPN 会话已失效(上游 302 跳转登录页)。watch 会自动重签,稍后重试即可' };
+  }
   const detail = bodyObj && (bodyObj.errorMessage || bodyObj.message || bodyObj.error?.message ||
     bodyObj.detail || (typeof bodyObj.error === 'string' ? bodyObj.error : ''));
   if (bodyObj?.status === 10003) {
