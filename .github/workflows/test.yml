@@ -11,11 +11,17 @@ permissions:
 jobs:
   syntax:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 覆盖 engines 声明的最低版本(18.14)与当前推荐线(20/24):
+        # 声明与验证必须一致,18.x 失败则要么修代码要么收紧 engines(需单独决策)
+        node: ['18.14', 20, 24]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
-          node-version: 24
+          node-version: ${{ matrix.node }}
       # 语法门:覆盖所有 .js(含不被入口加载的 dashboard.js / smoke-real.js)。
       # 用 node --check 而非 eslint,保持"零 npm 依赖,clone 即用"。
       # smoke-real.js 有意不进 CI:它访问真实校方服务并消耗配额
@@ -23,10 +29,11 @@ jobs:
         run: |
           node -e "const fs=require('fs'),path=require('path');const files=[];const walk=d=>{for(const e of fs.readdirSync(d,{withFileTypes:true})){if(e.isDirectory()){if(e.name!=='node_modules')walk(path.join(d,e.name))}else if(e.name.endsWith('.js'))files.push(path.join(d,e.name))}};walk('.');for(const f of files)require('child_process').execFileSync(process.execPath,['--check',f],{stdio:'inherit'})"
 
-      # 纯函数层(payload/aggregator/stream-parser/errors),零 I/O;
+      # 纯函数层(payload/aggregator/stream-parser/errors/tokenizer/update-check)
+      # 与 mock 上游集成测试(upstream-integration),零真实 I/O;
       # 协议行为(未知帧型/网关形态)不在此处——那是 smoke-real.js 的职责,
       # 有意不进 CI(访问真实校方服务并消耗配额)
-      - name: Pure-function tests
+      - name: Tests
         run: node --test
 
   platform:

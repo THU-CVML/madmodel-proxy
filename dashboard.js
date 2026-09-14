@@ -106,7 +106,7 @@ if (!noUpdate || noUpdate === '0') {
   checkForUpdate('noroadback/madmodel-proxy', pkg.version)
     .then(r => {
       if (r && r.update) {
-        console.log(`[dashboard] 有新版本 ${r.update}(当前 v${pkg.version})。在项目文件夹里 git pull,再重开本窗口即可升级`);
+        console.log(`[dashboard] 有新版本 ${r.update}(当前 v${pkg.version})。项目文件夹 git pull 后重开本窗口;变更说明见 github.com/noroadback/madmodel-proxy/releases`);
       }
     })
     .catch(() => {});

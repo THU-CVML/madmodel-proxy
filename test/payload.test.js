@@ -207,3 +207,56 @@ test('预算适配: max_tokens 缺省但 prompt 本身超限 → 413', () => {
   const r = fitTokenBudget(263000, p, 262144);
   assert.strictEqual(r.ok, false);
 });
+
+// ---- C5: 思考感知预算(两处,边界 0/1/511/512) ----
+test('思考感知: 原生 kwargs thinking:false 时 max_tokens:16 不被抬到 512', () => {
+  const p = { model: MODEL, max_tokens: 16, chat_template_kwargs: { thinking: false }, messages: [] };
+  const applied = normalizePayload(p, MODEL);
+  assert.strictEqual(p.max_tokens, 16);
+  assert.ok(!applied.includes('max_tokens→512'));
+});
+
+test('思考感知: 方言冲突时任一关闭信号即关闭(effort=high + 原生 false)', () => {
+  const p = { model: MODEL, max_tokens: 16, reasoning_effort: 'high', chat_template_kwargs: { thinking: false }, messages: [] };
+  normalizePayload(p, MODEL);
+  assert.strictEqual(p.max_tokens, 16);
+  assert.strictEqual(p.chat_template_kwargs.thinking, false);
+});
+
+test('思考感知: 关闭思考 + 剩余 100 + 预算 1000 → 收缩到 100 放行', () => {
+  const p = { max_tokens: 1000, chat_template_kwargs: { thinking: false } };
+  const r = fitTokenBudget(262044, p, 262144);
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(p.max_tokens, 100);
+});
+
+test('思考感知边界: 剩余 0/1/511/512 × 思考开/关', () => {
+  // room=262144-prompt
+  const mk = (room, off) => ({
+    max_tokens: 1000,
+    ...(off ? { chat_template_kwargs: { thinking: false } } : {}),
+  });
+  // 剩余 0:两种形态都拒绝
+  assert.strictEqual(fitTokenBudget(262144, mk(0, true), 262144).ok, false);
+  assert.strictEqual(fitTokenBudget(262144, mk(0, false), 262144).ok, false);
+  // 剩余 1:思考关闭收缩到 1;思考开启拒绝(<512)
+  const pOff1 = mk(1, true);
+  const rOff1 = fitTokenBudget(262143, pOff1, 262144);
+  assert.strictEqual(rOff1.ok, true);
+  assert.strictEqual(pOff1.max_tokens, 1);
+  assert.strictEqual(fitTokenBudget(262143, mk(1, false), 262144).ok, false);
+  // 剩余 511:思考关闭收缩到 511;思考开启拒绝
+  const pOff511 = mk(511, true);
+  const rOff511 = fitTokenBudget(261633, pOff511, 262144);
+  assert.strictEqual(rOff511.ok, true);
+  assert.strictEqual(pOff511.max_tokens, 511);
+  assert.strictEqual(fitTokenBudget(261633, mk(511, false), 262144).ok, false);
+  // 剩余 512:两种形态都收缩到 512
+  const pOn512 = mk(512, false);
+  const rOn512 = fitTokenBudget(261632, pOn512, 262144);
+  assert.strictEqual(rOn512.ok, true);
+  assert.strictEqual(pOn512.max_tokens, 512);
+  const pOff512 = mk(512, true);
+  assert.strictEqual(fitTokenBudget(261632, pOff512, 262144).ok, true);
+  assert.strictEqual(pOff512.max_tokens, 512);
+});

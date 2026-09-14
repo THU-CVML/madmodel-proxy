@@ -42,9 +42,12 @@ function normalizePayload(payload, model) {
     delete payload.n;
     applied.push('-n');
   }
-  // 关闭思考的方言先判定(判定字段随后会被剥离)
+  // 关闭思考的方言先判定(判定字段随后会被剥离)。任一关闭信号即关闭
+  // (含原生 chat_template_kwargs.thinking:false——1.8.1 前漏识别,导致原生
+  // 方言的客户端在归一化与预算收缩两处都被当成"思考开启"处理)
   const wantsNoThinking = payload.reasoning_effort === 'none' ||
-    payload.thinking === false || payload.thinking?.type === 'disabled';
+    payload.thinking === false || payload.thinking?.type === 'disabled' ||
+    payload.chat_template_kwargs?.thinking === false;
   // 新版 OpenAI 客户端(SDK v5+/部分智能体框架)用 max_completion_tokens
   // 替代 max_tokens——两者同义,统一收敛到 max_tokens 再做区间约束,否则
   // 384K 规格和 16 预算都能绕过下面的上下限。两个键并存时以新键为准
@@ -89,17 +92,28 @@ function normalizePayload(payload, model) {
 // 上游按 prompt_tokens+max_tokens ≤ 262,144 逐 token 校验(2026-09-10 实测,
 // 边界随 prompt 精确平移)。预检超限时不拒绝:把 max_tokens 收到剩余空间
 // 再发——max_tokens 是输出上限而非目标,收缩对绝大多数请求无感,代价仅
-// 高位长输出需续写(finish_reason:length)。剩余空间放不下最小输出预算
-// (512)才判 413:prompt 本身超限。max_tokens 缺省时仅在 prompt 本身超限
-// 才拒绝(上游缺省输出预算未知,不注入不收缩,交上游仲裁)
+// 高位长输出需续写(finish_reason:length)。剩余空间放不下最低输出预算才
+// 判 413:prompt 本身超限。预算下限思考感知(1.8.1):思考开启/缺省时 512
+// (思考会消耗输出预算,极小预算让 content 恒空——ZCode 探测请求实测);
+// 关闭思考后预算全给内容,1 即有效,0 意味着一个输出 token 都放不下,拒绝。
+// max_tokens 缺省时仅在 prompt 本身超限才拒绝(上游缺省输出预算未知,
+// 不注入不收缩,交上游仲裁)。归一化先于本函数执行,思考关闭此时恒表达为
+// chat_template_kwargs.thinking === false
 function fitTokenBudget(promptTokens, payload, contextWindow) {
   const budget = typeof payload.max_tokens === 'number' ? payload.max_tokens : 0;
   if (promptTokens + budget <= contextWindow) return { ok: true, note: '' };
   const room = contextWindow - promptTokens;
-  if (room < 512) {
+  // 思考关闭的判定与归一化的 wantsNoThinking 同源(三方言+原生)。生产路径
+  // 恒先归一化(届时已统一为 kwargs 形态),但本函数不静默依赖该前置——
+  // 直接调用的原始形态方言同样得到正确下限
+  const noThinking = payload.chat_template_kwargs?.thinking === false ||
+    payload.reasoning_effort === 'none' ||
+    payload.thinking === false || payload.thinking?.type === 'disabled';
+  const floor = noThinking ? 1 : 512;
+  if (room < floor) {
     return {
       ok: false,
-      message: `prompt ${promptTokens} tokens 已达上游 ${contextWindow} tokens 上下文上限,连最小输出预算 512 都放不下。请新开会话或在客户端压缩 history 后重试。`,
+      message: `prompt ${promptTokens} tokens 已达上游 ${contextWindow} tokens 上下文上限,剩余空间放不下最低输出预算 ${floor}。请新开会话或在客户端压缩 history 后重试。`,
     };
   }
   payload.max_tokens = room;
