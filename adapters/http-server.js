@@ -3,7 +3,7 @@
 // (Content-Length 预检/限额/超时)、响应写出(JSON/SSE/错误)、token 文件的
 // mtime 热加载缓存。业务判定在 core/proxy-service.js。
 // 本模块是 core 与 platform 之间的装配点:core 不接触 req/res/fs。
-// 本地无鉴权:只监听 127.0.0.1 + Host 白名单即为本机边界(设计取舍见 README)。
+// 本地无鉴权:只监听 127.0.0.1 + Host 白名单即为本机边界(边界说明见 SECURITY.md)。
 
 'use strict';
 

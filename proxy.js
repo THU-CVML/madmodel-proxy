@@ -10,8 +10,8 @@
 //   4. 伪造 GET /v1/models(上游不存在该端点,返回 SPA HTML)
 //   5. 预检:body > 950KB 提前 413(nginx 1MB 硬限,留余量)
 //   6. 并发不受业务层限制(多子代理编排是合法负载;实测上游 ≥24 并发流无压力),
-//      资源兜底靠 server.maxConnections 与各级超时/字节上限(见 README 安全设计)
-//   7. 本机安全边界:Host 白名单 + 各级限额与超时(本地无鉴权,见 README 设计取舍)
+//      资源兜底靠 server.maxConnections 与各级超时/字节上限(见 SECURITY.md)
+//   7. 本机安全边界:Host 白名单 + 各级限额与超时(本地无鉴权,边界说明见 SECURITY.md)
 //
 // 架构分层:core/(业务与协议,无平台依赖) + adapters/(HTTP 适配) +
 // platform/(DPAPI/路径/原子文件/进程锁)。环境变量清单见 README 配置表。

@@ -6,7 +6,7 @@
 
 | 数据 | 静态存储 | 传输目的地 | 备注 |
 |---|---|---|---|
-| 统一认证密码 | 按平台静态加密（Windows DPAPI / macOS 登录钥匙串 / Linux 机器绑定加密），`creds.json` 或钥匙串，状态目录 `~/.madmodel-proxy/` | 仅以 SM2 加密报文发往 `id.tsinghua.edu.cn` | 不写日志、不进命令行、不经任何第三方 |
+| 统一认证密码 | 按平台静态加密（Windows DPAPI / macOS 登录钥匙串 / Linux 机器绑定加密），`creds.json` 或钥匙串，状态目录 `~/.madmodel-proxy/` | 仅以 SM2 加密报文发往 `id.tsinghua.edu.cn` | 不写日志、不经任何第三方；命令行传递的平台差异见下文 |
 | madmodel token | 按平台静态加密，同上（`token.json` 或钥匙串） | 仅作为 Bearer 头发往 WebVPN 隧道（`webvpn.tsinghua.edu.cn`，2026-09-10 起上游默认走隧道） | 同上 |
 | WebVPN 会话 cookie | 按平台静态加密，随 token 一同存储（`token.json` 密文字段 `cipherCookie`，或钥匙串 `webvpn-cookie` 条目） | 仅随上游请求以 `Cookie` 头回传 WebVPN 隧道，用于隧道会话保活 | 与 token 同级秘密，凭它可冒用整个 WebVPN 会话；不写日志 |
 | 对话内容 | 不落盘（默认） | 经本代理发往 madmodel 上游 | `DUMP_FAILED=1` 时失败请求会落盘到状态目录，该文件含完整对话，排障后应删除 |
@@ -14,12 +14,13 @@
 
 ## 明确不会发生的事
 
-- 密码、token 和 WebVPN 会话 cookie 不写日志、不进 PowerShell 命令行参数、不发往 `*.tsinghua.edu.cn` 之外的任何地址
+- 密码、token 和 WebVPN 会话 cookie 不写日志、不发往 `*.tsinghua.edu.cn` 之外的任何地址（默认配置；自定义 `PROXY_UPSTREAM` 时 Bearer token 会发往所配置的地址，信任边界由配置者自担）
+- 命令行传递按平台如实说明：Windows 上秘密不经命令行参数（DPAPI 经 stdin 通道）；macOS 上秘密以 base64 形态经 `security` 命令行参数传入钥匙串
 - 登录链重定向只跟随 `https://*.tsinghua.edu.cn`，被引向校外地址立即中止
-- 代理只监听 `127.0.0.1`，外部网络无法直连（本地无鉴权，边界就是本机回环加 Host 白名单）
+- 代理只监听 `127.0.0.1`，外部网络无法直连。边界是"本机回环 + Host/Origin 白名单"：防的是外部网络与浏览器恶意页面，不防同机其他进程（本地无鉴权，任何本机程序都可调用）；多用户共享机器上其他本地账户同样可达回环端口
 - 浏览器恶意页面无法借本机端口盲发请求烧配额：跨源 POST 浏览器必带 Origin 头，非本机来源直接拒绝；非浏览器客户端（SDK、智能体）不发 Origin，不受影响
 - 仓库目录不写入任何运行时数据，诊断和状态文件都在状态目录（Windows 为 `%USERPROFILE%\.madmodel-proxy\`，macOS / Linux 为 `~/.madmodel-proxy/`）
-- Linux 的机器绑定加密：密钥由 `/etc/machine-id` 与当前用户派生，密文文件被拷贝或同步到其他机器后不可解（按无数据处理）；macOS 钥匙串同理，离开当前用户的钥匙串即不可读
+- Linux 的机器绑定加密：密钥由 `/etc/machine-id` 与当前用户派生，密文文件被拷贝或同步到其他机器后不可解（按无数据处理）；macOS 钥匙串同理，离开当前用户的钥匙串即不可读。机器绑定防的是密文被云同步或拷贝到其他机器的意外泄漏；machine-id 与用户名本身不是秘密，不防同时拿到密文与原机标识的定向攻击者（与 DPAPI/钥匙串由操作系统秘密背书的强度不同）
 
 ## 漏洞报告
 

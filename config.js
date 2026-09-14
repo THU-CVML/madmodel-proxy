@@ -70,7 +70,7 @@ module.exports = Object.freeze({
   // 64 覆盖多子代理编排的合法负载。刻意不可配置——见 proxy-service 注释
   inflightHardLimit: 64,
 
-  // 上游超时与限额(并发不受业务层限制,见 README"设计取舍")
+  // 上游超时与限额(并发不受业务层限制,取舍见 core/proxy-service 注释)
   upstreamHeaderTimeout: 30e3,     // 发出请求到收到响应头的超时
   streamIdleTimeout: 120e3,        // 流式空闲超时(实测晚高峰 ~36tps,120s 足够)
   streamTotalTimeout: numberEnv('PROXY_STREAM_TOTAL_MS', 1200e3),

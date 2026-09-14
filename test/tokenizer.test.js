@@ -2,7 +2,9 @@
 // 所有关键值来自 2026-09-10 oracle 校准(上游 usage.prompt_tokens 直测):
 // 单消息 content+模板开销逐 case 精确;多轮与工具结构按保守模型恒 ≥ oracle
 // (预检门的安全方向是高估——提前收缩可接受,漏放会被上游拒)。上游换
-// 分词器/改模板时这些断言会红,以 usage.prompt_tokens 重新对测校准。
+// 分词器/改模板时这些断言不会变红——离线钉值只锁本地实现的回归,检测
+// 上游漂移需重新以 usage.prompt_tokens 对测(勘误:此前版本在此宣称会红,
+// 系表述错误)。
 'use strict';
 
 const test = require('node:test');

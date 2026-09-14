@@ -12,7 +12,7 @@
 git clone https://github.com/noroadback/madmodel-proxy.git
 cd madmodel-proxy
 
-# 首次配置:输入学号+密码(首次含二次认证,只需一次)
+# 首次配置:输入学号+密码(首次登录需二次认证)
 node refresh-token.js login
 ```
 
@@ -62,8 +62,8 @@ PROXY_UPSTREAM=https://madmodel.cs.tsinghua.edu.cn/v1/chat/completions npm start
 ## 特性
 
 - **零依赖**。纯 Node 原生，clone 即用，无 `npm install`
-- **token 全自动**。到期前 30 分钟自动走完整登录链（含二次认证、可信设备登记），热加载免重启
-- **本地精确分词**。内置 DeepSeek 公开分词器（与学校部署逐 token 一致，24 万 token 级实测校准），按上游同一规则（`prompt+max_tokens ≤ 262,144`）预检；`max_tokens` 超限时自动收缩到剩余空间放行（输出上限而非目标，收缩无感），仅 prompt 本身超限才 413
+- **token 自动续期**。到期前 30 分钟自动走登录链换新，热加载免重启。通常无需人工干预；学校要求重新验证（如可信设备失效）时重跑一次 `node refresh-token.js login`
+- **本地分词预检**。内容分词与学校部署在实测样本上逐 token 一致。预检按 `prompt+max_tokens ≤ 262,144` 判定，超限自动收缩输出预算放行（极长输出可能提前截断需续写），剩余不足最低输出预算时 413
 - **静态加密存储**。Windows 用 DPAPI、macOS 用登录钥匙串、Linux 用机器绑定加密
 - **单窗口运行**。Windows 双击 start.cmd、macOS / Linux 用 `npm start`，同窗拉起守护与代理，Ctrl+C 或关窗全停
 
@@ -80,7 +80,7 @@ PROXY_UPSTREAM=https://madmodel.cs.tsinghua.edu.cn/v1/chat/completions npm start
 | 请求 503 | 本地无 token。没做过 login，或 `[watch]` 日志有报错 |
 | 请求 413 上下文超限 | 会话接近 262,144 tokens 上限（`max_tokens` 已被代理自动收缩过仍不够）。新开会话，或让客户端压缩 history |
 | 启动报 `端口 8080 已被占用` | 代理已在运行，直接使用；需另开实例时用 `PROXY_PORT` |
-| 上游 401/502/429 | 上游侧问题，通常自愈；持续出现提 issue 附代理日志 |
+| 请求 502/429 | 按错误信息区分：含"繁忙"是上游过载，稍后重试；含"会话失效"几秒后重试（自动重签中）；含"上下文超限"按 413 行处理；其他持续出现提 issue 附代理日志 |
 | 闲置过久后请求异常 | 隧道会话空闲过期（cookie 闲置约 2 小时失效）。watch 守护每 `PROXY_KEEPALIVE_MS`（默认 25 分钟）保活隧道、会话失效自动重签 token+cookie，通常无需干预 |
 | token 长期无人续期 | 改过密码或二次认证过期，重跑一次 `node refresh-token.js login` |
 | 仓库文件夹丢失 | 重新 clone 即可，登录状态不丢：状态目录（`~/.madmodel-proxy/`）与仓库分离 |

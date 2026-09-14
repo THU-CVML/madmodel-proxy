@@ -4,8 +4,8 @@
 
 ## 开发环境
 
-- Node.js 18.14 以上（`fetch` / `AbortController` 依赖这条版本线）
-- Windows 10/11。凭据加密用 DPAPI，登录链实测于 Windows，完整功能仅 Windows
+- Node.js 18.14 以上（`fetch` / `AbortController` 依赖这条版本线；CI 在 18.14 / 20 / 24 上验证）
+- 三平台：Windows / macOS / Linux。凭据加密分别用 DPAPI / 登录钥匙串 / 机器绑定加密；登录链实测于 Windows，macOS/Linux 的存储与启动路径由 CI 冒烟覆盖（跨平台实机验证欢迎贡献）
 - 别改动 `.gitattributes`，它锁定了换行策略
 
 ## 安装与运行
@@ -21,9 +21,11 @@ node proxy.js          :: 或 start.cmd 单窗口模式
 
 ## 验证改动
 
-- 本地快速验证是 `node --check`（CI 的语法门跑的就是它，覆盖全部 .js）
-- 改动 SSE 解析、错误处理、超时这类协议行为后，跑 `npm run smoke` 做真实流量冒烟，需要代理在线、有效 token、消耗少量配额
-- PR 描述里写清楚改了什么行为、怎么验证的
+- `npm test`：离线测试（单元 + mock 上游集成），CI 三平台 × Node 18.14/20/24 全跑
+- `node scripts/platform-smoke.js`：跨平台存储/启动冒烟（独立状态目录与钥匙串命名空间，不触碰真实凭据，不访问学校服务）
+- 改动 SSE 解析、错误处理、超时这类协议行为后，跑 `npm run smoke` 做真实流量冒烟（需要代理在线、有效 token、消耗少量配额）——mock 测不出真实网关的形态
+- `npm run check:release`：发布前检查
+- PR 描述里写清楚改了什么行为、跑过上面哪几层验证
 
 ## 提 Issue
 
