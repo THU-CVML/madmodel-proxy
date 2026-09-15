@@ -16,7 +16,7 @@ cd madmodel-proxy
 node refresh-token.js login
 ```
 
-凭据静态加密存于 `%USERPROFILE%\.madmodel-proxy\`（macOS / Linux 为 `~/.madmodel-proxy/`），加密形态与数据流向见 [SECURITY.md](SECURITY.md)。
+凭据静态加密存于 `%USERPROFILE%\.madmodel-proxy\`（macOS / Linux 为 `~/.madmodel-proxy/`），加密形态与数据流向见 [SECURITY.md](SECURITY.md)。不再使用时清除本机凭据：关闭 start.cmd 后运行 `node refresh-token.js logout`（清除密码、token 与隧道会话；学校侧登录状态不受影响）。
 
 Windows 双击 **start.cmd** 启动（首次会问是否创建桌面快捷方式；代理已在运行时再次运行会显示状态，不会重复启动），macOS / Linux 运行 `npm start`。窗口保持开启。启动成功的标志是下面这样的输出：
 
@@ -82,6 +82,8 @@ PROXY_UPSTREAM=https://madmodel.cs.tsinghua.edu.cn/v1/chat/completions npm start
 | 启动报 `端口 8080 已被占用` | 代理已在运行，直接使用；需另开实例时用 `PROXY_PORT` |
 | 请求 502/429 | 按错误信息区分：含"繁忙"是上游过载，稍后重试；含"会话失效"几秒后重试（自动重签中）；含"上下文超限"按 413 行处理；其他持续出现提 issue 附代理日志 |
 | 闲置过久后请求异常 | 隧道会话空闲过期（cookie 闲置约 2 小时失效）。watch 守护每 `PROXY_KEEPALIVE_MS`（默认 25 分钟）保活隧道、会话失效自动重签 token+cookie，通常无需干预 |
+| 改密码后窗口大量报错并停止续期 | 正常保护行为。重新 `node refresh-token.js login`，登录后自动恢复 |
+| 切换网络后第一句响应很慢 | 会话失效正在自动重签（数秒内完成并自动重试），无需操作 |
 | token 长期无人续期 | 改过密码或二次认证过期，重跑一次 `node refresh-token.js login` |
 | 仓库文件夹丢失 | 重新 clone 即可，登录状态不丢：状态目录（`~/.madmodel-proxy/`）与仓库分离 |
 
