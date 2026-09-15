@@ -74,7 +74,11 @@ module.exports = Object.freeze({
   inflightHardLimit: 64,
 
   // 上游超时与限额(并发不受业务层限制,取舍见 core/proxy-service 注释)
-  upstreamHeaderTimeout: 30e3,     // 发出请求到收到响应头的超时
+  // 75s 高于学校网关自身的 60s 超时(2026-09-13/15 两次故障实测:后端死时
+  // 精确 60s 返回 504)。设 30s 时我们比学校先放弃——过载期 31~60s 能回的
+  // 请求被误杀,后端真死时用户看到我们的含糊 502 而非学校网关的 504。
+  // 75s 让学校的 60s 仲裁先跑完:慢而活着的走完,真死的拿到准确 504
+  upstreamHeaderTimeout: 75e3,     // 发出请求到收到响应头的超时
   streamIdleTimeout: 120e3,        // 流式空闲超时(实测晚高峰 ~36tps,120s 足够)
   streamTotalTimeout: numberEnv('PROXY_STREAM_TOTAL_MS', 1200e3),
   nonstreamTotalTimeout: numberEnv('PROXY_NONSTREAM_TOTAL_MS', 600e3), // 非流式聚合总超时(实测流式 600s 不断)
