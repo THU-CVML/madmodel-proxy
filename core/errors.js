@@ -25,7 +25,23 @@ function translateUpstreamError(bodyObj, raw, status, busyHint) {
   if (bodyObj?.status === 10003) {
     return { http: 401, message: '认证失败(token 无效或已过期)。请确认 watch 守护进程在运行: node refresh-token.js watch' };
   }
+  // "疑似上下文超限"复判:上游拒绝与本地计量的组合判定,10001 与"繁忙"
+  // 文案两分支共用(判定与措辞不各写一份)。upstreamShape 描述上游侧的
+  // 拒绝形态,由各分支提供
+  const likelyOverflow = hint => hint &&
+    (hint.promptTokens + hint.tokenBudget > hint.contextWindow ||
+      hint.promptTokens >= hint.contextWindow);
+  const overflowMessage = (hint, upstreamShape) =>
+    `疑似上下文超限:${upstreamShape},本地精确计量 prompt ${hint.promptTokens} + max_tokens ${hint.tokenBudget} 已达上限 ${hint.contextWindow}。请新开会话或压缩 history 后重试;若小请求也报此错,才是上游真的繁忙`;
+
   if (bodyObj?.status === 10001) {
+    // 结构化 10001 与"繁忙"文案是同族拒绝(消息文案自己就写着"可能是上下文
+    // 超限"),但此前不查 busyHint,超限被报 429——客户端带退避无限重试一个
+    // 永远不会成功的请求。与文案分支同判(2026-09-16 补齐)。注意:10001+
+    // 超限这一组合未经实测,是按同族语义的推断
+    if (likelyOverflow(busyHint)) {
+      return { http: 413, message: overflowMessage(busyHint, '上游以状态码 10001 拒绝(推断:与"繁忙"文案为同族拒绝,组合未经实测)') };
+    }
     return { http: 429, message: `上游拒绝:${detail || '(上游未提供详情)'}(可能是上下文超限≈256K、请求体超限 1MB 或服务繁忙)` };
   }
   if (typeof bodyObj?.errorMessage === 'string' && /繁忙/.test(bodyObj.errorMessage)) {
@@ -36,9 +52,8 @@ function translateUpstreamError(bodyObj, raw, status, busyHint) {
     // 防御性保留:prompt+实际发出的 max_tokens 达上限才改判 413,给客户端
     // "新开会话/压缩 history"的处置;其余(含上游漂移——本地计数同样低估,
     // 此处无法判别)保持 429 等待语义
-    if (busyHint && (busyHint.promptTokens + busyHint.tokenBudget > busyHint.contextWindow ||
-      busyHint.promptTokens >= busyHint.contextWindow)) {
-      return { http: 413, message: `疑似上下文超限:上游对超限请求也返回"服务器繁忙"(实测形态),本地精确计量 prompt ${busyHint.promptTokens} + max_tokens ${busyHint.tokenBudget} 已达上限 ${busyHint.contextWindow}。请新开会话或压缩 history 后重试;若小请求也报此错,才是上游真的繁忙` };
+    if (likelyOverflow(busyHint)) {
+      return { http: 413, message: overflowMessage(busyHint, '上游对超限请求也返回"服务器繁忙"(2026-09-10 实测复现)') };
     }
     return { http: 429, message: `上游繁忙(SSE 内嵌错误): ${bodyObj.errorMessage}` };
   }

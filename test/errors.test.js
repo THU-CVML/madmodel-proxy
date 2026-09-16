@@ -79,6 +79,30 @@ test('复判: 恰等于上限不算超限(上游 > 才拒)', () => {
   assert.strictEqual(m.http, 429);
 });
 
+// ---- 10001 复判:结构化状态码与"繁忙"文案同族(2026-09-16 补齐,此前该分支
+// 不查 busyHint,超限被报 429 诱导客户端无限重试)。复判逻辑与"繁忙"分支
+// 经共享 helper(likelyOverflow)实现,边界语义一致,此处钉 10001 分支的接线 ----
+test('10001 复判: 超限 → 413(与繁忙文案分支同判)', () => {
+  const m = translateUpstreamError({ status: 10001, message: '服务器繁忙' }, '', 200, hintOver);
+  assert.strictEqual(m.http, 413);
+  assert.ok(m.message.includes('上下文超限'));
+});
+
+test('10001 复判: 短小请求 → 保持 429', () => {
+  const m = translateUpstreamError({ status: 10001 }, '', 200, { ...hintOver, promptTokens: 1000 });
+  assert.strictEqual(m.http, 429);
+});
+
+test('10001 复判: 恰等于上限 → 429(> 才拒,与繁忙分支边界一致)', () => {
+  const m = translateUpstreamError({ status: 10001 }, '', 200, { promptTokens: 196608, tokenBudget: 65536, contextWindow: 262144 });
+  assert.strictEqual(m.http, 429);
+});
+
+test('10001 复判: 无 busyHint → 保持 429', () => {
+  const m = translateUpstreamError({ status: 10001, message: '服务器繁忙' }, '', 200);
+  assert.strictEqual(m.http, 429);
+});
+
 test('映射: 有 detail 无结构化状态 → 502 上游拒绝请求', () => {
   const m = translateUpstreamError({ message: '某错误' }, '', 400);
   assert.strictEqual(m.http, 502);

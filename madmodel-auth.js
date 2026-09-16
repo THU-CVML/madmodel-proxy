@@ -72,6 +72,10 @@ const ROAMING_URL = `${INFO_PREFIX}/b/yyfw/vyyfwxx/info/portal_fg/common/onlineA
 const MADMODEL_VPN_PREFIX = WEBVPN_PREFIX +
   '/https/77726476706e69737468656265737421fdf6459128346d5c300b9ae28c462a3b27469fc32211fa26a3e464';
 const MADMODEL_AUTH_CHECK_URL = `${MADMODEL_VPN_PREFIX}/model-api/auth-login/check?ticket=`;
+// madmodel 隧道内 models 地址:登录期会话判定(verifyWebVpnSession)与 config.js
+// 保活探测(keepaliveUrl)共用的探测目标——单一来源,防两处路径漂移后
+// "登录判定与保活探的不是同一条路径"的静默错位
+const MADMODEL_TUNNEL_MODELS_URL = `${MADMODEL_VPN_PREFIX}/v1/models`;
 const MADMODEL_ROAMING_ID = '19D04E39D96B36C494F2E48A1A4741FD';
 
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -527,11 +531,19 @@ class MadmodelAuthClient {
     }
   }
 
+  // 会话有效性判定。旧判据(2026-09-16 前生效):GET /login?oauth_login=true,
+  // 已登录时最终页不含登录表单(sm2publicKey)。2026-09-16 学校 WebVPN 改版后
+  // 该入口对任何状态(含已登录、带有效票)一律 302 到 id 登录表单,旧判据恒为
+  // false——登录实际成功、票实际有效(隧道探测 200 实测),却被误报
+  // "登录后未见会话",watch 续期从此卡死。
+  // 新判据:带会话 cookie 探测 madmodel 隧道内地址(与 watch 保活探活、代理
+  // 上游请求同一条路径——判定即真实业务可用性):3xx = 会话无效,2xx/4xx/5xx
+  // = 穿过隧道到达应用即有效。网络错误保守判无效(与旧版 catch 行为一致)
   async verifyWebVpnSession() {
-    try {
-      const probe = await requestWithRedirects({ url: WEBVPN_OAUTH_LOGIN() }, this.jar);
-      return /sm2publicKey/i.test(String(probe.body || '')) === false;
-    } catch (e) { return false; }
+    const verdict = await probeWebvpnSession(
+      MADMODEL_TUNNEL_MODELS_URL,
+      this.jar.headerFor(WEBVPN_PREFIX + '/'));
+    return verdict === 'ok';
   }
 
   // oauth 域锚点 → lb-auth/lbredirect 形式(uri 不编码)。URL 形式对齐
@@ -781,6 +793,8 @@ module.exports = {
   // cookie 回传——单一来源,防止复制串漂移导致"上游是隧道但保活/cookie 判定
   // 失效"的静默错位
   MADMODEL_VPN_PREFIX,
+  // 隧道内 models 探测地址(登录期会话判定与保活共用,见常量定义处注释)
+  MADMODEL_TUNNEL_MODELS_URL,
   // 以下为认证链中出错概率最高的纯判定函数(响应体解码/URL 解析/重定向白名单)。
   // 认证链无法端到端离线验证,单独导出便于本地复现与审查
   decodeBody,

@@ -6,7 +6,7 @@
 'use strict';
 
 const paths = require('./platform/paths');
-const { MADMODEL_VPN_PREFIX } = require('./madmodel-auth');
+const { MADMODEL_VPN_PREFIX, MADMODEL_TUNNEL_MODELS_URL } = require('./madmodel-auth');
 
 // 解析环境变量中的数字:空/未定义用默认值;非有限数、负数回退默认值;
 // 0 仅在默认值本身为 0 时有意义,其余场景 0 视同非法(避免 0 意外关掉某项
@@ -102,7 +102,7 @@ module.exports = Object.freeze({
   // 探测失败分类见 madmodel-auth.js probeWebvpnSession;注入与循环在
   // auth-service.watch / core/scheduler.js
   keepAliveIntervalMs: numberEnv('PROXY_KEEPALIVE_MS', 25 * 60 * 1000),
-  keepaliveUrl: keepaliveMatch ? keepaliveMatch[1] + 'v1/models' : null,
+  keepaliveUrl: keepaliveMatch ? MADMODEL_TUNNEL_MODELS_URL : null,
 
   // A1 等待重试的等待预算:确认的 WebVPN 会话失效(隧道 3xx)时,代理等
   // watch 重签后重试一次,这里是等待上限(是预算不是恢复时间保证)
