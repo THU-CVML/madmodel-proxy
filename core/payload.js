@@ -120,4 +120,48 @@ function fitTokenBudget(promptTokens, payload, contextWindow) {
   return { ok: true, note: ` norm[max_tokens→${room} 预检收缩]` };
 }
 
-module.exports = { parseJsonBody, normalizePayload, fitTokenBudget };
+// 图片/多模态输入预检(1.9.2)。背景(2026-09-16 四组对照实测):上游对含
+// image_url 内容段的请求 0.1~0.2 秒即时拒绝——与请求体积、base64 是否合法
+// 无关(纯文本 200 / 合法 8×8 PNG 429 / 伪 base64 429 / 用户原图 429),
+// 响应文案是上游掩饰用的"服务器繁忙"。客户端据此带退避无限重试,而含图的
+// 历史消息每轮都会重发,该会话从此永久 429。本地预检把这条"永远失败且原因
+// 不可见"的路径变成说清原因与处置的 400。
+//
+// 判定边界(刻意收窄,只碰 messages[*].content 数组里的段类型):
+//   - messages 非数组、content 为字符串(常规文本)一律放行
+//   - 文本语义的段放行:type === 'text'(chat 格式)、type === 'input_text'
+//     (部分客户端混用 Responses 风格的类型名,内容仍是纯文本);段没有 type
+//     字段也放行(不是带类型标注的多模态段,无实测证据前不误伤,交上游仲裁)
+//   - 其余任何带 type 的段(image_url / input_image / input_audio / file 等)
+//     一律拒绝
+//   - messages 以外的字段(tools / tool_calls 定义等)一概不看:工具定义
+//     本身上游接受(实测透传 200),判定它们会误伤
+// 明确不做静默剥离:剥掉图片后放行会让模型基于残缺上下文作答而用户不知情,
+// 违反本项目"不伪造"纪律(同类取舍见 CHANGELOG 1.8.1 的运行期错误语义)。
+// model 由调用方注入(同 normalizePayload),本模块保持纯函数
+function checkContentSupport(payload, model) {
+  const messages = payload.messages;
+  if (!Array.isArray(messages)) return { ok: true };
+  for (let i = 0; i < messages.length; i++) {
+    const content = messages[i]?.content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      if (!part || typeof part !== 'object') continue;
+      const type = part.type;
+      // type 缺省或空串 = 无类型标注(非多模态段),交上游仲裁不误伤;
+      // 其余任何带 type 的段(含 base64 编码的 image_url 等)一律拒绝
+      if (!type || type === 'text' || type === 'input_text') continue;
+      return {
+        ok: false,
+        index: i,
+        type,
+        // 文案为维护者定稿(2026-09-18):只说事实与处置,不做论证
+        message: `会话历史含不受支持的图片/多模态输入(第 ${i + 1} 条消息有 type:"${type}" 段),` +
+          `上游 ${model} 不支持视觉输入,重试无效。请新开一个会话,或移除该消息中的图片后重试`,
+      };
+    }
+  }
+  return { ok: true };
+}
+
+module.exports = { parseJsonBody, normalizePayload, fitTokenBudget, checkContentSupport };

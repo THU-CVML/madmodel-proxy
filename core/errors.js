@@ -65,11 +65,51 @@ function translateUpstreamError(bodyObj, raw, status, busyHint) {
   return { http: 502, message: `上游返回无法识别的响应(前 200 字符): ${String(raw || '').slice(0, 200)}` };
 }
 
+// 学校网关的读空闲超时实测 60.0~60.1s(2026-09-16 记录:直连与隧道两条路径
+// 都有这堵墙——非流式 60.1s 收到 504 错误页;流式下首帧等待与流中静默同样
+// 会撞,强制流式只是部分缓解)。截断文案据此分两形态,处置不同
+const GATEWAY_IDLE_MS = 60e3;
+
 // "流未以合法 [DONE] 结束"的形态(截断 / 坏帧 / 总时限):流式与非流式只在
-// note 前缀上不同,判定与措辞不各写一份
-function describeFailedStream(result, notePrefix, config) {
+// note 前缀上不同,判定与措辞不各写一份。
+// result.idleMs 由 upstream-client 记录:距上一帧收到的时长(从未收到字节时
+// 即整个请求已等待时长),是区分"首帧都没等到"与"中途停帧"的依据。
+// sentBytes 为流式路径已交付给客户端的字节数(聚合路径没有交付,不传):
+// 中途截断形态据此说明已收内容交付到哪里
+function describeFailedStream(result, notePrefix, config, sentBytes) {
   if (result.type === 'protocol-error' && result.reason === 'truncated') {
-    return { note: `${notePrefix}-truncated`, message: '上游流被截断(未见终止标记 [DONE])' };
+    const note = `${notePrefix}-truncated`;
+    const idleMs = Number.isFinite(result.idleMs) ? result.idleMs : null;
+    if (idleMs === null) {
+      // 调用方未提供时长:保持简短形态,不臆断触发场景
+      return { note, message: '上游流被截断(未见终止标记 [DONE])' };
+    }
+    const idleS = Math.round(idleMs / 1000);
+    // 零字节形态:上游从未产出任何字节。sawBytes 是 upstream-client 的精确
+    // 标记(未收字节时 idleMs 覆盖整个请求时长,即"idleMs ≈ 总时长"的同义
+    // 判据);无该字段的调用方退回 idleMs 与总时长的比较
+    const sawBytes = typeof result.sawBytes === 'boolean'
+      ? result.sawBytes
+      : !(Number.isFinite(result.elapsedMs) && idleMs >= result.elapsedMs);
+    if (!sawBytes && idleMs >= GATEWAY_IDLE_MS) {
+      return { note, message:
+        '上游长时间未产出首字节，建议等待后重试或减小会话上下文' };
+    }
+    if (sawBytes) {
+      const delivered = typeof sentBytes === 'number' && sentBytes > 0
+        ? `已收内容完整交付到第 ${(sentBytes / 1024).toFixed(1)} KB,客户端可重试`
+        : '客户端可重试';
+      // 中途截断的归因看静默时长:网关读空闲墙掐断时,代理侧测得的"距上一帧"
+      // 与网关计时几乎同刻 ≈ 60s;静默很短就断的是连接层被掐(隧道黑洞/连接
+      // 重置/上游早夭),归因网关会和同句里的秒数自相矛盾
+      if (idleMs >= GATEWAY_IDLE_MS) {
+        return { note, message: `上游流被截断(距上一帧 ${idleS}s,疑似学校网关 60 秒超时)。${delivered}` };
+      }
+      return { note, message: `上游流被截断(距上一帧 ${idleS}s 后连接中断)。${delivered}` };
+    }
+    // 未收到任何字节、也未达网关墙(连接层早夭:隧道黑洞/连接被重置):
+    // 不带"网关超时"归因,只说事实
+    return { note, message: `上游流被截断(未见终止标记 [DONE],等待首字节 ${idleS}s 后连接中断)` };
   }
   if (result.type === 'protocol-error') {
     return { note: `${notePrefix}-invalid`, message: result.message || '上游 SSE 协议错误' };

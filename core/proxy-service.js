@@ -11,7 +11,7 @@
 
 'use strict';
 
-const { normalizePayload, parseJsonBody, fitTokenBudget } = require('./payload');
+const { normalizePayload, parseJsonBody, fitTokenBudget, checkContentSupport } = require('./payload');
 const { translateUpstreamError, describeFailedStream } = require('./errors');
 const { createAggregator } = require('./completion-aggregator');
 const { getTokenizer } = require('./tokenizer');
@@ -59,6 +59,12 @@ function createProxyService(deps) {
       `${((Date.now() - started) / 1000).toFixed(1)}s ${(size / 1024).toFixed(0)}KB ${note}`);
   }
 
+  // 截断日志补"距上一帧时长"(R2):idleMs 由 upstream-client 记(首帧前为请求
+  // 已等待时长),用同一口径的秒数进日志,与错误文案对得上;缺值时不写
+  function idleNote(result) {
+    return Number.isFinite(result?.idleMs) ? ` idle=${(result.idleMs / 1000).toFixed(1)}s` : '';
+  }
+
   // 会话累计 token(仅内存,重启归零)。usageNote 在每条成功请求的日志处调用并
   // 顺带累加,调用点保持单行
   const tokTotal = { p: 0, c: 0, r: 0 };
@@ -68,7 +74,7 @@ function createProxyService(deps) {
     tokTotal.c += u.completion_tokens;
     const hasR = typeof u.reasoning_tokens === 'number';
     if (hasR) tokTotal.r += u.reasoning_tokens;
-    const fmt = n => n >= 10000 ? `${(n / 1000).toFixed(1)}K` : String(n);
+    const fmt = n => n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : (n >= 10000 ? `${(n / 1000).toFixed(1)}K` : String(n));
     return ` | tok ${u.prompt_tokens}+${u.completion_tokens}` +
       (hasR ? `(r${u.reasoning_tokens})` : '') +
       ` 累计 ${fmt(tokTotal.p)}+${fmt(tokTotal.c)}` + (tokTotal.r ? `(r${fmt(tokTotal.r)})` : '');
@@ -98,6 +104,14 @@ function createProxyService(deps) {
         note: e.code === 'INVALID_JSON' ? 'bad-json' : 'not-object',
       } };
     }
+    // 图片/多模态输入预检(1.9.2,R1):上方含图 → 上游 0.1~0.2s 秒拒并伪装成
+    // "服务器繁忙",客户端带退避无限重试而每轮历史都带图,会话从此永久失败。
+    // 就地 400 说清原因与处置(不静默剥离图片,理由见 core/payload.js)。
+    // 位置在分词预检之前——这类请求体积可能极大(base64),不必先花分词成本
+    const contentCheck = checkContentSupport(payload, config.model);
+    if (!contentCheck.ok) {
+      return { error: { status: 400, message: contentCheck.message, note: 'image-input' } };
+    }
     const clientWantsStream = payload.stream === true;
     payload.stream = true; // 对上游强制流式(绕 60s nginx 非流式超时)
     // 上游 usage 默认不回,仅在 stream_options.include_usage 时返回(含
@@ -116,8 +130,9 @@ function createProxyService(deps) {
 
   // 上游结果 → 终态描述({status, note, message};failed-stream 带标记,两条
   // 路径对它的收尾各有额外上下文要记)。每类结果只在这里转换一次,
-  // 流式/聚合仅在 note 前缀不同
-  function mapResult(result, prefix) {
+  // 流式/聚合仅在 note 前缀不同。sentBytes 供截断文案说明"已交付到第 N KB"
+  // (流式路径传已写出的字节数,聚合路径无交付不传)
+  function mapResult(result, prefix, sentBytes) {
     switch (result.type) {
       case 'timeout':
         if (result.phase === 'idle') {
@@ -128,9 +143,9 @@ function createProxyService(deps) {
           const message = `上游 ${config.upstreamHeaderTimeout / 1000}s 未返回响应头(连接或网关挂起)`;
           return { status: 502, note: `proxy-err:${message.slice(0, 60)}`, message };
         }
-        return { status: 502, failedStream: true, ...describeFailedStream(result, prefix, config) };
+        return { status: 502, failedStream: true, ...describeFailedStream(result, prefix, config, sentBytes) };
       case 'protocol-error':
-        return { status: 502, failedStream: true, ...describeFailedStream(result, prefix, config) };
+        return { status: 502, failedStream: true, ...describeFailedStream(result, prefix, config, sentBytes) };
       case 'network-error':
         return { status: 502, note: `proxy-err:${String(result.cause).slice(0, 60)}`,
           message: `代理到上游请求失败: ${result.cause}` };
@@ -323,17 +338,17 @@ function createProxyService(deps) {
       ).slice(0, 120).replace(/\s+/g, ' ')}`);
       return;
     }
-    const mapped = mapResult(result, 'stream');
+    const mapped = mapResult(result, 'stream', ctx.sseBytes());
     if (mapped) {
       // failed-stream:不能补 [DONE] 伪装成完整回答。已发头则断流,客户端的
       // 截断检测/重试接手;stream-invalid 携带坏帧预览让日志有"为什么"可查
       if (mapped.failedStream) {
         if (ctx.sseHeadersSent()) {
           ctx.endResponse();
-          logReq(req, 200, started, size, `${mapped.note},${(ctx.sseBytes() / 1024).toFixed(1)}KB` +
+          logReq(req, 200, started, size, `${mapped.note}${idleNote(result)},${(ctx.sseBytes() / 1024).toFixed(1)}KB` +
             (result.message ? ` ${result.message.slice(0, 70)}` : ''));
         } else {
-          logReq(req, 502, started, size, mapped.note);
+          logReq(req, 502, started, size, `${mapped.note}${idleNote(result)}`);
           ctx.sendError(502, mapped.message);
         }
         return;
@@ -438,7 +453,7 @@ function createProxyService(deps) {
     if (mapped) {
       // failed-stream:未以合法 [DONE] 结束即失败,不把半截回答当完整 completion 交付
       if (mapped.failedStream) {
-        logReq(req, 502, started, size, `${mapped.note},${chunkCount}chunks`);
+        logReq(req, 502, started, size, `${mapped.note}${idleNote(result)},${chunkCount}chunks`);
         return ctx.sendError(502, `${mapped.message},已收 ${chunkCount} 块,请重试`);
       }
       return failRequest(ctx, mapped);

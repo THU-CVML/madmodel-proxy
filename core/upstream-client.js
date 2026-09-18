@@ -13,6 +13,13 @@
 //   {type:'protocol-error', reason:'truncated'|'invalid', message}
 //   {type:'network-error', cause}               fetch/读取层网络错误
 //
+// truncated 结果额外带 idleMs(距上一帧收到的时长;从未收到字节时即整个请求
+// 已等待时长)与 sawBytes(是否收到过任何字节),错误文案据此区分"首帧都没等到"
+// 与"中途停帧"两形态。
+//
+// idle 守卫的口径:按"上游产出字节"计时,下游交付(onChunk,含背压等待)期间
+// 挂起——客户端停读造成的静默不是上游挂死。交付完成后重新计时。
+//
 // onChunk(obj) 收每个 SSE data JSON,可为 async(背压等待期间不再读上游);
 // onOpen(isSse) 在上游响应头到达时调用一次。
 //
@@ -56,6 +63,8 @@ function createUpstreamClient(config) {
 
   function request({ payload, token, cookie, signal, onChunk, onOpen }) {
     return new Promise((resolve) => {
+      // 零字节截断时"已等待多久"的计时起点(见 truncated 结果的 idleMs)
+      const requestStart = Date.now();
       // 单一 AbortController:外部 signal(客户端断开/聚合超时)与 header 超时
       // 都汇入这里;idle/total 超时经 cancelBody 令读取循环结束。
       // 不用 AbortSignal.any:手动桥接对所有 Node 版本一致,且已覆盖 aborted 初态
@@ -188,11 +197,18 @@ function createUpstreamClient(config) {
         const parser = new SseParser(sseLineLimit);
         let total = 0;
         let usage = null;
+        // 上游产出与"我们读到的字节"绑定的两个量:是否收到过任何字节、最后
+        // 一个字节的时刻。空闲守卫按字节到达重排(R2 的 idleMs 同源,不可各记
+        // 一份——口径漂移会让日志时长与判定对不上)
+        let sawBytes = false;
+        let lastBytesAt = 0;
         armIdle();
         for (;;) {
           const { done, value } = await reader.read();
           if (settled) return;
           if (done) break;
+          sawBytes = true;
+          lastBytesAt = Date.now();
           armIdle();
           total += value.length;
           if (total > upstreamSseTotalLimit) {
@@ -224,18 +240,36 @@ function createUpstreamClient(config) {
             }
             if (obj?.usage) usage = obj.usage;
             if (onChunk) {
+              // 下游交付期间挂起空闲守卫(onChunk 可以是 async:透传路径的
+              // waitDrain 就等在它内部)。客户端停读造成的背压会让本循环长
+              // 时间不读上游,但那段静默是代理自己造成的,不是上游挂死——
+              // 计入的话守卫会在 streamIdleTimeout 处掐掉健康流,还把死因
+              // 记成上游空闲(2026-09-16 复现)。交付完成后按"现在"重新计时;
+              // 客户端永久停读仍有 streamTotalTimeout 兜底,不会无限挂住
+              clearTimeout(idleTimer);
               try { await onChunk(obj); }
               catch (e) {
                 cancelBody();
                 return finish({ type: 'network-error', cause: `下游写失败(客户端已断开): ${String(e?.message || e)}` });
               }
+              if (settled) return;
+              // 背压等待不计入 idleMs:lastBytesAt 只在读上游时更新,若不
+              // 刷新,下游停读 N 秒后截断时文案里的"距上一帧"会虚高 N 秒
+              lastBytesAt = Date.now();
+              armIdle();
             }
             if (settled) return;
           }
         }
         // EOF 但未见 [DONE]:上游截断(网关掐流/连接中断),不能当正常结束,
-        // 否则下游会把半截回答当完整回答
-        finish({ type: 'protocol-error', reason: 'truncated', message: '上游流被截断(未见终止标记 [DONE])' });
+        // 否则下游会把半截回答当完整回答。idleMs 一并带回:距上一帧收到的
+        // 时长(首帧都没等到时为整个请求已等待时长),供错误文案区分两形态
+        finish({
+          type: 'protocol-error', reason: 'truncated',
+          message: '上游流被截断(未见终止标记 [DONE])',
+          idleMs: Date.now() - (sawBytes ? lastBytesAt : requestStart),
+          sawBytes,
+        });
       })().catch((e) => {
         // 唯一的主错误通道:外部取消优先,其余按网络错误带回 cause
         if (signal?.aborted) return finish({ type: 'aborted' });

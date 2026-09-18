@@ -79,7 +79,16 @@ module.exports = Object.freeze({
   // 请求被误杀,后端真死时用户看到我们的含糊 502 而非学校网关的 504。
   // 75s 让学校的 60s 仲裁先跑完:慢而活着的走完,真死的拿到准确 504
   upstreamHeaderTimeout: 75e3,     // 发出请求到收到响应头的超时
-  streamIdleTimeout: 120e3,        // 流式空闲超时(实测晚高峰 ~36tps,120s 足够)
+  // 守卫是学校网关读空闲墙(60s,2026-09-16 实测:直连与隧道都有,非流式
+  // 60.1s 收 504;流式下首帧等待与流中静默同样会撞)之后的影子兜底,哲学同
+  // 上方 75s 的 upstreamHeaderTimeout——让学校的 60s 仲裁先跑完:网关掐的流
+  // 以"EOF 无 [DONE]"到达,错误文案据此归因网关(core/errors.js);本守卫只兜
+  // 网关掐不动的挂死形态(TCP 挂死不收包时连 EOF 都没有)。不得压到墙下:
+  // 上游对流式请求先回响应头再静默预填,idle 计时从响应头到达就开始,实测
+  // 121k token 首帧 58.4s——守卫若 <60s 会先掐掉这类合法请求,且掐出的
+  // idle-timeout 形态让网关归因文案永不触发。65s = 墙 + 5s 余量。背压静默
+  // 已不计入(交付期间守卫挂起,见 core/upstream-client.js)
+  streamIdleTimeout: numberEnv('PROXY_IDLE_MS', 65e3),
   streamTotalTimeout: numberEnv('PROXY_STREAM_TOTAL_MS', 1200e3),
   nonstreamTotalTimeout: numberEnv('PROXY_NONSTREAM_TOTAL_MS', 600e3), // 非流式聚合总超时(实测流式 600s 不断)
   upstreamJsonBodyLimit: 5 * 1024 * 1024,   // JSON 错误页/直答体上限

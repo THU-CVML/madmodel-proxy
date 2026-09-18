@@ -25,6 +25,10 @@ process.env.PROXY_TOKEN_FILE = TOKEN_FILE;
 // 隧道形态验证(生产中该路径只在默认隧道上游下可达)
 process.env.PROXY_RETRY_WAIT_MS = '2000';
 process.env.MADMODEL_FORCE_TUNNEL_MODE = '1';
+// 空闲守卫压到 1.2s(默认 65s 见 config.streamIdleTimeout):R3 的背压回归
+// 用例要靠"停读时长 > 阈值"来验证守卫不把背压静默计入上游空闲,1.2s 让
+// 用例秒级完成。其余用例的替身上游都是即时应答,不受此阈值影响
+process.env.PROXY_IDLE_MS = '1200';
 
 const test = require('node:test');
 const assert = require('node:assert');
@@ -121,6 +125,27 @@ test('上游错误判定集成矩阵(mock 上游 + 完整代理实例)', async t
       assert.strictEqual(r.json.choices?.[0]?.message?.content, 'ok');
     });
 
+    // ---- R1(1.9.2):含 image_url 的请求在本地 400,不发上游 ----
+    await t.test('R1: 含 image_url 的会话历史 → 本地 400,不触达上游', async () => {
+      let upstreamHits = 0;
+      mock.set((req, res) => { upstreamHits++; sse(res, [JSON.stringify(CH), JSON.stringify(USAGE)]); });
+      const r = await chat(false, { messages: [
+        { role: 'user', content: [{ type: 'text', text: '看这张图' }, { type: 'image_url', image_url: { url: 'data:image/png;base64,AA' } }] },
+      ] });
+      assert.strictEqual(r.status, 400);
+      assert.strictEqual(upstreamHits, 0, '含图请求不得转发到上游');
+      assert.ok(r.json.error.message.includes('图片'), r.json.error.message);
+      assert.ok(r.json.error.message.includes('新开一个会话'), r.json.error.message);
+    });
+
+    await t.test('R1: 纯文本与纯 text 段的 content 数组照常放行(不误伤)', async () => {
+      mock.set((req, res) => sse(res, [JSON.stringify(CH), JSON.stringify(USAGE)]));
+      const a = await chat(false, { messages: [{ role: 'user', content: '纯文本' }] });
+      assert.strictEqual(a.status, 200);
+      const b = await chat(false, { messages: [{ role: 'user', content: [{ type: 'text', text: '纯文本段' }] }] });
+      assert.strictEqual(b.status, 200);
+    });
+
     await t.test('非 2xx + SSE content-type + 标准 error 对象: 不得成为 200 假成功', async () => {
       mock.set((req, res) => sse(res, [JSON.stringify({ error: { message: 'busy', type: 'server_error' } })], { status: 500 }));
       const r = await chat(false);
@@ -166,6 +191,75 @@ test('上游错误判定集成矩阵(mock 上游 + 完整代理实例)', async t
       const r = await chat(false);
       assert.strictEqual(r.status, 502);
       assert.ok(r.json.error.message.includes('截断'));
+    });
+
+    // ---- R2(1.9.2):截断文案带"距上一帧时长"。upstream-client 记 idleMs
+    // (距上一帧收到字节的时长),经 mapResult 进 message 与日志 ----
+    await t.test('R2: 中途截断的文案带"距上一帧 Ns"(idleMs 真实来自静默时长)', async () => {
+      mock.set((req, res) => {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.write(`data: ${JSON.stringify(CH)}\n\n`);
+        setTimeout(() => res.end(), 700); // 700ms 静默后断流(未发 [DONE])
+      });
+      const t0 = Date.now();
+      const r = await chat(false);
+      assert.strictEqual(r.status, 502);
+      assert.ok(r.json.error.message.includes('距上一帧 1s'), r.json.error.message);
+      // 700ms 静默远未达网关 60s 墙:连接中断形态,不归因网关(归因边界见 errors.js)
+      assert.ok(r.json.error.message.includes('连接中断'), r.json.error.message);
+      assert.ok(!r.json.error.message.includes('网关'), r.json.error.message);
+      assert.ok(r.json.error.message.includes('已收 1 块'), r.json.error.message);
+      assert.ok(Date.now() - t0 >= 700, '文案里的时长应来自真实等待');
+    });
+
+    // ---- R3 回归(1.9.2):客户端背压不得被计入上游空闲。修复前守卫在
+    // PROXY_IDLE_MS 处掐掉健康流(客户端收不到 [DONE],日志记 idle-timeout),
+    // 复现记录见任务书 R3;此处用真实 TCP 停读制造背压 ----
+    await t.test('R3 回归: 客户端停读(背压)超过空闲阈值 → 不掐流,完整交付 [DONE]', async () => {
+      mock.set((req, res) => {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        let n = 0;
+        const frame = () => {
+          if (res.destroyed) return;
+          if (n >= 400) { res.write('data: [DONE]\n\n'); res.end(); return; }
+          n++;
+          const obj = { ...CH, choices: [{ index: 0, delta: { content: 'x'.repeat(16000) } }] };
+          if (res.write(`data: ${JSON.stringify(obj)}\n\n`)) frame();
+          else res.once('drain', frame); // 上游自身也守背压:代理停读则暂停出帧
+        };
+        frame();
+      });
+      const out = await new Promise(resolve => {
+        const body = JSON.stringify({
+          model: 'DeepSeek-V4-Flash-0731',
+          messages: [{ role: 'user', content: '回复ok' }],
+          max_tokens: 512, stream: true,
+        });
+        let total = 0, paused = false, sawDone = false;
+        const rq = http.request({
+          host: '127.0.0.1', port, path: '/v1/chat/completions', method: 'POST',
+          headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) },
+        }, rs => {
+          rs.on('data', c => {
+            total += c.length;
+            if (c.includes('[DONE]')) sawDone = true;
+            if (!paused && total > 200000) { // 已收足够多 → 停读 2.5s(> 2× 阈值)
+              paused = true;
+              rs.pause();
+              setTimeout(() => rs.resume(), 2500);
+            }
+          });
+          const done = () => resolve({ total, paused, sawDone });
+          rs.on('end', done);
+          rs.on('close', done);
+        });
+        rq.on('error', e => resolve({ total, paused, sawDone, error: String(e.message) }));
+        rq.end(body);
+      });
+      assert.strictEqual(out.error, undefined, String(out.error));
+      assert.ok(out.paused, '用例前提:客户端确实停读过(制造了背压)');
+      assert.ok(out.sawDone, '流应正常结束([DONE]),而不是被空闲守卫掐断');
+      assert.ok(out.total > 6e6, `应收到全部 400 帧,实际 ${out.total} 字节`);
     });
 
     // ---- A1 等待重试(确认的 WebVPN 会话失效 → 等重签 → 重试一次) ----

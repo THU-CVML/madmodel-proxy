@@ -4,7 +4,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert');
-const { parseJsonBody, normalizePayload, fitTokenBudget } = require('../core/payload');
+const { parseJsonBody, normalizePayload, fitTokenBudget, checkContentSupport } = require('../core/payload');
 
 const MODEL = 'DeepSeek-V4-Flash-0731';
 
@@ -206,6 +206,94 @@ test('预算适配: max_tokens 缺省但 prompt 本身超限 → 413', () => {
   const p = {};
   const r = fitTokenBudget(263000, p, 262144);
   assert.strictEqual(r.ok, false);
+});
+
+// ---- checkContentSupport:图片/多模态输入预检(1.9.2,R1) ----
+// 上游对含 image_url 的请求 0.1~0.2s 秒拒并伪装成"服务器繁忙"(四组对照实测),
+// 含图历史每轮重发 → 会话永久失败。本预检把判定收窄到 content 数组里的段类型
+test('图片预检: 纯文本消息(string content)通过', () => {
+  const p = { messages: [{ role: 'user', content: '你好' }, { role: 'assistant', content: '在' }] };
+  assert.strictEqual(checkContentSupport(p, MODEL).ok, true);
+});
+
+test('图片预检: content 数组只有 text 段通过', () => {
+  const p = { messages: [{ role: 'user', content: [{ type: 'text', text: '你好' }] }] };
+  const r = checkContentSupport(p, MODEL);
+  assert.strictEqual(r.ok, true);
+});
+
+test('图片预检: content 数组含 image_url 段拒绝', () => {
+  const p = { messages: [{ role: 'user', content: [
+    { type: 'text', text: '这是什么' },
+    { type: 'image_url', image_url: { url: 'data:image/png;base64,iVBORw0KGgo=' } },
+  ] }] };
+  const r = checkContentSupport(p, MODEL);
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.type, 'image_url');
+  assert.strictEqual(r.index, 0);
+});
+
+test('图片预检: 图片在历史深处(非末条)也拒绝,错误指向该条', () => {
+  const p = { messages: [
+    { role: 'user', content: '开头' },
+    { role: 'assistant', content: [{ type: 'text', text: '看这张图' }, { type: 'image_url', image_url: { url: 'https://x/y.png' } }] },
+    { role: 'user', content: '继续' },
+  ] };
+  const r = checkContentSupport(p, MODEL);
+  assert.strictEqual(r.ok, false);
+  assert.ok(r.message.includes('第 2 条消息'), r.message);
+});
+
+test('图片预检: 错误文案含事实与处置建议(维护者定稿)', () => {
+  const p = { messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AA' } }] }] };
+  const r = checkContentSupport(p, MODEL);
+  assert.ok(r.message.includes('图片'), r.message);
+  assert.ok(r.message.includes('新开一个会话'), r.message);
+  assert.ok(r.message.includes('重试无效'), r.message);
+});
+
+test('图片预检: 其他多模态段(input_audio/file)同样拒绝', () => {
+  for (const type of ['input_audio', 'file', 'audio_url']) {
+    const p = { messages: [{ role: 'user', content: [{ type, [type]: {} }] }] };
+    const r = checkContentSupport(p, MODEL);
+    assert.strictEqual(r.ok, false, type);
+    assert.strictEqual(r.type, type);
+  }
+});
+
+// 判定边界(防误伤):以下形态属合法请求,必须放行——它们与图片无关,
+// 上游工具定义实测接受(透传 200)
+test('图片预检边界: tools 定义 / tool_calls 里的字段不动,不被误判', () => {
+  const p = {
+    messages: [
+      { role: 'user', content: '调用工具' },
+      { role: 'assistant', content: null, tool_calls: [{ id: 't1', type: 'function', function: { name: 'view_image', arguments: '{"url":"a.png"}' } }] },
+      { role: 'tool', tool_call_id: 't1', content: '{"image_url":"data:image/png;base64,AA"}' },
+    ],
+    tools: [{ type: 'function', function: { name: 'view_image', parameters: { type: 'object', properties: { image_url: { type: 'string' } } } } }],
+  };
+  const r = checkContentSupport(p, MODEL);
+  assert.strictEqual(r.ok, true, r.message);
+});
+
+test('图片预检边界: 无 type 字段的段、空串 type、非对象段放行(交上游仲裁)', () => {
+  const p = { messages: [{ role: 'user', content: [{ text: '无类型标注' }, { type: '', text: '空串类型' }, '裸字符串', null] }] };
+  assert.strictEqual(checkContentSupport(p, MODEL).ok, true);
+});
+
+test('图片预检边界: input_text(Responses 风格类型名的纯文本段)放行', () => {
+  const p = { messages: [{ role: 'user', content: [{ type: 'input_text', text: '你好' }] }] };
+  assert.strictEqual(checkContentSupport(p, MODEL).ok, true);
+});
+
+test('图片预检边界: messages 缺省/非数组、content 为 null(纯 tool_calls 消息)放行', () => {
+  assert.strictEqual(checkContentSupport({}, MODEL).ok, true);
+  assert.strictEqual(checkContentSupport({ messages: 'nope' }, MODEL).ok, true);
+  assert.strictEqual(checkContentSupport({ messages: [{ role: 'assistant', content: null }] }, MODEL).ok, true);
+});
+
+test('图片预检边界: content 数组为空数组放行', () => {
+  assert.strictEqual(checkContentSupport({ messages: [{ role: 'user', content: [] }] }, MODEL).ok, true);
 });
 
 // ---- C5: 思考感知预算(两处,边界 0/1/511/512) ----
