@@ -116,6 +116,8 @@ PROXY_UPSTREAM=https://madmodel.cs.tsinghua.edu.cn/v1/chat/completions npm start
 |---|---|---|
 | `PROXY_UPSTREAM` | 默认 WebVPN 隧道 | 覆盖上游端点，**优先级最高**：设了就跳过首次的网络询问、也不会被它覆盖（高级用法）。校内直连用 `madmodel.cs.tsinghua.edu.cn/v1/chat/completions`；测试可指向本地假上游；否则保持默认，由首次询问决定 |
 | `PROXY_PORT` | `8080` | 监听端口 |
+| `PROXY_BIND_HOST` | `127.0.0.1` | 监听地址。默认仅本机；设 `0.0.0.0` 对局域网开放。**非回环监听时必须配 `PROXY_API_KEYS`**（否则 proxy.js 仍会起但任何人可用；随附的 `scripts/service.sh` 会直接拒绝裸奔启动） |
+| `PROXY_API_KEYS` | 空（不鉴权） | 逗号分隔的 API Key。非空即开启鉴权：请求头 `Authorization: Bearer <key>` 或 `x-api-key: <key>`（时间恒定比较，任一命中即放行）。空时沿用「仅回环 + Host 白名单」的原边界。对外监听时强烈建议设置。`GET /healthz` 恒免鉴权（回 `ok`，供探活） |
 | `PROXY_REFRESH_AHEAD_MS` | 1800000 | 提前续期窗口（毫秒） |
 | `PROXY_NO_TOKEN_WAIT_MS` | 60000 | watch 守护未配置凭据时的重查间隔（毫秒） |
 | `PROXY_MAX_SLEEP_MS` | 3600000 | watch 守护单次等待上限（毫秒），到点醒来重读 token 状态 |

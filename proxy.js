@@ -82,7 +82,17 @@ httpServer.server.listen(config.port, config.host, () => {
   const auth = httpServer.auth;
   console.log(`madmodel 本地端点已启动: http://${config.host}:${config.port}/v1`);
   console.log(`模型: ${config.models.join(', ')}`);
-  console.log('本地无鉴权(客户端 API key 填任意值);安全边界为本机回环 + Host 白名单');
+  // 安全边界随监听形态与鉴权配置变化:三种成立形态各自说清,避免"以为开了
+  // 鉴权其实没开"或"以为只对本机其实对外"的误判。
+  const loopbackOnly = ['127.0.0.1', 'localhost', '::1'].includes(config.host);
+  if (config.apiKeys.length > 0) {
+    console.log(`鉴权: 已启用 API Key(${config.apiKeys.length} 个);请求头 Authorization: Bearer <key> 或 x-api-key`);
+    console.log(loopbackOnly
+      ? '监听: 仅本机回环(127.0.0.1)'
+      : `监听: 对外开放(${config.host})——局域网可访问,边界为 API Key 鉴权`);
+  } else {
+    console.log('本地无鉴权(客户端 API key 填任意值);安全边界为本机回环 + Host 白名单');
+  }
   console.log(`token 文件: ${paths.display(paths.TOKEN_FILE)}(热加载,续期免重启)`);
   const t = auth.getToken();
   if (t) {
