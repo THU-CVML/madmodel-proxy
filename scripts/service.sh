@@ -81,10 +81,12 @@ start() {
     [ -x "$NODE" ] || command -v "$NODE" >/dev/null 2>&1 || { echo "madproxy: 找不到 node($NODE)" >&2; return 1; }
     [ -f "$PROXY_DIR/dashboard.js" ] || { echo "madproxy: $PROXY_DIR 下没有 dashboard.js" >&2; return 1; }
     mkdir -p "$LOG_DIR"
-    # dashboard.js 同窗拉起 watch 续期 + proxy;env 注入监听/鉴权/上游
+    # dashboard.js 同窗拉起 watch 续期 + proxy;env 注入监听/鉴权/上游。
+    # 用 export 而非命令前缀:${VAR:+NAME=val} 展开出的赋值在 dash 里会被当
+    # 命令名执行(而非赋值),故显式 export,PROXY_UPSTREAM 仅在非空时设。
     ( cd "$PROXY_DIR"; \
-      PROXY_PORT="$PORT" PROXY_BIND_HOST="$BIND" PROXY_API_KEYS="$KEYS" \
-      ${UPSTREAM:+PROXY_UPSTREAM="$UPSTREAM"} \
+      export PROXY_PORT="$PORT" PROXY_BIND_HOST="$BIND" PROXY_API_KEYS="$KEYS"; \
+      [ -n "$UPSTREAM" ] && export PROXY_UPSTREAM="$UPSTREAM"; \
       nohup "$NODE" dashboard.js >"$LOG_FILE" 2>&1 & echo $! > "$PID_FILE" )
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
         alive && {
