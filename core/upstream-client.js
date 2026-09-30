@@ -36,12 +36,13 @@ const { randomUUID } = require('crypto');
 const { SseParser } = require('./stream-parser');
 
 // 限量读:错误页/直答异常膨胀时及时放弃,不无限缓冲(超限抛 UPSTREAM_BODY_LIMIT)
-async function readLimited(reader, limit) {
+async function readLimited(reader, limit, onProgress) {
   const parts = [];
   let total = 0;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
+    if (value.length && onProgress) onProgress();
     total += value.length;
     if (total > limit) {
       // 已结束的 reader 再次 cancel 属重复取消,是该忽略的清理错误
@@ -173,6 +174,12 @@ function createUpstreamClient(config) {
           signal: lifecycle.signal,
         });
         clearTimeout(headerTimer);
+        upBody = up.body;
+        // 所有响应体均受总时限约束，含持续发字节的错误响应。
+        totalTimer = setTimeout(() => {
+          cancelBody();
+          finish({ type: 'timeout', phase: 'total' });
+        }, streamTotalTimeout);
         // 非 2xx 一律走错误翻译,不再按 content-type 决定路径(1.8.1):
         // 实测复现过 500 + text/event-stream + 标准 error 对象帧的形态,旧
         // 逻辑把它当正常流送进聚合器,下游收到 200 + content:null 的假成功。
@@ -183,7 +190,7 @@ function createUpstreamClient(config) {
           let text;
           try {
             reader = up.body.getReader();
-            text = (await readLimited(reader, upstreamJsonBodyLimit)).toString('utf8');
+            text = (await readLimited(reader, upstreamJsonBodyLimit, armIdle)).toString('utf8');
           } catch (e) {
             cancelBody();
             return finish({ type: 'network-error', cause: `上游错误响应读取失败: ${String(e?.message || e)}` });
@@ -197,17 +204,11 @@ function createUpstreamClient(config) {
           return finish({
             type: 'upstream-error', status: up.status, body: obj,
             raw: text.slice(0, 500), location: up.headers.get('location'),
+            retryAfter: up.headers.get('retry-after'),
           });
         }
         const isSse = /event-stream/i.test(up.headers.get('content-type') || '');
         if (onOpen) onOpen(isSse);
-        upBody = up.body;
-        // 总时限统一覆盖两条应答路径(SSE 与 JSON fallback):空闲超时挡不住
-        // "周期性发字节"的流,总上限兜底并发槽占用
-        totalTimer = setTimeout(() => {
-          cancelBody();
-          finish({ type: 'timeout', phase: 'total' });
-        }, streamTotalTimeout);
 
         if (!isSse) {
           // 流式请求被以 JSON 应答(典型:上游一切错误都走 200+JSON;
@@ -217,7 +218,7 @@ function createUpstreamClient(config) {
           let text;
           try {
             reader = up.body.getReader();
-            text = (await readLimited(reader, upstreamJsonBodyLimit)).toString('utf8');
+            text = (await readLimited(reader, upstreamJsonBodyLimit, armIdle)).toString('utf8');
           } catch (e) {
             cancelBody();
             if (e?.code === 'UPSTREAM_BODY_LIMIT') {
@@ -229,7 +230,7 @@ function createUpstreamClient(config) {
           let obj = null;
           try { obj = JSON.parse(text); } catch (e) { /* 非 JSON 错误页:按 body=null 带回原文 */ }
           if (obj?.choices) return finish({ type: 'completion', body: obj });
-          return finish({ type: 'upstream-error', status: up.status, body: obj, raw: text.slice(0, 500) });
+          return finish({ type: 'upstream-error', status: up.status, body: obj, raw: text.slice(0, 500), retryAfter: up.headers.get('retry-after') });
         }
 
         // SSE 路径:解析器负责 UTF-8 解码与行边界;总量限量防异常大流吃内存
@@ -276,7 +277,7 @@ function createUpstreamClient(config) {
             if (obj && typeof obj === 'object' && !obj.choices &&
                 (obj.errorMessage !== undefined || (obj.error && typeof obj.error === 'object'))) {
               cancelBody();
-              return finish({ type: 'upstream-error', status: up.status, body: obj, raw: JSON.stringify(obj).slice(0, 500) });
+              return finish({ type: 'upstream-error', status: up.status, body: obj, raw: JSON.stringify(obj).slice(0, 500), retryAfter: up.headers.get('retry-after') });
             }
             if (obj?.usage) usage = obj.usage;
             if (onChunk) {
@@ -290,6 +291,9 @@ function createUpstreamClient(config) {
               try { await onChunk(obj); }
               catch (e) {
                 cancelBody();
+                if (e?.code === 'UPSTREAM_TOOL_INDEX') {
+                  return finish({ type: 'protocol-error', reason: 'invalid', message: e.message });
+                }
                 return finish({ type: 'network-error', cause: `下游写失败(客户端已断开): ${String(e?.message || e)}` });
               }
               if (settled) return;

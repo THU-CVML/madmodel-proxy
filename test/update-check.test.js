@@ -1,6 +1,7 @@
 // test/update-check.test.js — 版本比较纯函数 + 注入 fetch 的检查器。
 // 比较语义是提示的触发条件,数值边界(1.10.0 > 1.9.0)与畸形输入必须钉死
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

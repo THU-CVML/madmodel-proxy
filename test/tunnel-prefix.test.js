@@ -9,6 +9,7 @@
 // 并把 path 与 ?ticket=... 一起丢掉——真触发时表现为"漫游未返回 ticket",
 // 且看不出原因。前缀形态即便出现,只要原样透传,ticket 就不会丢。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

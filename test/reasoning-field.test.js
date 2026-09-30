@@ -5,6 +5,7 @@
 // 2026-09-29 实测:最近 60 条 reasoning 记录里 DeepSeek 59 条、qwen 0 条;
 // 抓上游原始 SSE 帧确认 qwen 的思考确实在流里(delta 键 = role,content,reasoning)。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

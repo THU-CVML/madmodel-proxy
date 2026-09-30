@@ -9,6 +9,7 @@
 // 覆盖当时观测到的全部形态——**格式在漂移,解析器按结构而非固定标签名工作**,
 // 这些样本是防止它退化的基准。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

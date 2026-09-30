@@ -1,23 +1,4 @@
-// proxy.js
-// madmodel 本地 OpenAI 兼容端点的启动入口。
-// 监听 127.0.0.1:8080,供 dsh 等标准 OpenAI 客户端使用。
-//
-// 职责(按已验证的 API 规格书):
-//   1. token 热加载:每请求读 ~/.madmodel-proxy/token.json(watch 守护续期,免重启)
-//   2. 强制上游 stream:true 绕 60s nginx 非流式超时;客户端要非流式时自己聚合 SSE
-//   3. 错误翻译:上游错误统一翻译为标准 4xx/5xx;流截断(EOF 无 [DONE])按 502/
-//      断流处理,不聚合成假成功
-//   4. 伪造 GET /v1/models(上游不存在该端点,返回 SPA HTML)
-//   5. 预检:body > 950KB 提前 413(nginx 1MB 硬限,留余量)
-//   6. 并发不受业务层限制(多子代理编排是合法负载;实测上游 ≥24 并发流无压力),
-//      资源兜底靠 server.maxConnections 与各级超时/字节上限(见 SECURITY.md)
-//   7. 本机安全边界:Host 白名单 + 各级限额与超时(本地无鉴权,边界说明见 SECURITY.md)
-//
-// 架构分层:core/(业务与协议,无平台依赖) + adapters/(HTTP 适配) +
-// platform/(DPAPI/路径/原子文件/进程锁)。环境变量清单见 README 配置表。
-//
-// 用法: node proxy.js  (Ctrl+C 退出)
-
+// 本地 OpenAI 端点入口。组装请求服务、凭据热加载与后台模型探测。
 'use strict';
 
 const config = require('./config');
@@ -25,7 +6,7 @@ const { createUpstreamClient } = require('./core/upstream-client');
 const { createProxyService } = require('./core/proxy-service');
 const { createHttpServer, createTokenCache, createTokenState } = require('./adapters/http-server');
 const { getTokenizer } = require('./core/tokenizer');
-const { discoverModels, parseModelList, formatModelTable, describeProbeFailure, discoverWithCredentials } = require('./core/model-discovery');
+const { discoverModels, parseModelList, formatModelTable, describeProbeFailure, createDiscoveryRunner } = require('./core/model-discovery');
 const { createModelRegistry } = require('./core/model-registry');
 const paths = require('./platform/paths');
 const { atomicWrite } = require('./platform/file-store');
@@ -113,29 +94,17 @@ httpServer.server.listen(config.port, config.host, () => {
   } else {
     console.log('尚未登录，请运行 node refresh-token.js login');
   }
-  // 模型清单探测(1.10):学校随时增删/更名模型,硬编码的名字一旦失效,每个
-  // 请求都会失败且错误被翻译成含糊的"服务器繁忙"(2026-09-27 实测:被下架的
-  // 模型返回 200 + "模型不存在",代理层原样透传)。启动期把上游有什么、连通性
-  // 如何打印出来,不让用户从请求失败里猜。
-  // 不 await、不改 listen 时序(与 dashboard 的版本检查同一模式)。
-  // 无 token 或 token 已过期时跳过:start.cmd 同时拉起 watch 与代理,代理启动
-  // 瞬间可能读到续期前的旧值(见上方 token 行注释),此时探测必然 401——那是
-  // 时序问题不是模型问题,误报会让人去白改配置
-  if (t && t.expiresAt > Date.now()) {
-    discoverWithCredentials({
-      getCredentials: auth.getToken,
-      probe: credentials => runModelDiscovery({
-        upstreamUrl: config.upstream,
-        token: credentials?.token,
-        cookie: credentials?.cookie,
-        tunnelMode: config.tunnelMode,
-        configuredModel: config.model,
-      }),
-    }).then(results => {
+  // 等登录/续期完成后再探测；单次后台运行，不阻塞请求。
+  const discovery = createDiscoveryRunner({
+    getCredentials: auth.getToken,
+    probe: credentials => runModelDiscovery({
+      upstreamUrl: config.upstream, token: credentials.token, cookie: credentials.cookie,
+      tunnelMode: config.tunnelMode, configuredModel: config.model,
+    }),
+    publish: results => {
       modelRegistry.publish(results);
       console.log('模型状态');
       for (const line of formatModelTable(results)) console.log(line);
-      // 参考模型探测失败时给出处置；实际请求仍使用客户端指定的模型。
       const target = results.find(r => r.id === config.model);
       if (target && !target.ok) {
         console.log(describeProbeFailure(target.reason, config.model) +
@@ -143,8 +112,15 @@ httpServer.server.listen(config.port, config.host, () => {
       } else if (!target) {
         console.log(`未探测到 ${config.model}，客户端请使用 /v1/models 列出的模型名`);
       }
-    }).catch(() => { /* 探测自身异常不得影响代理运行 */ });
-  }
+    },
+  });
+  const tick = () => discovery.tick().then(() => {
+    if (discovery.complete) clearInterval(discoveryTimer);
+  });
+  const discoveryTimer = setInterval(tick, 2000);
+  discoveryTimer.unref();
+  httpServer.server.once('close', () => clearInterval(discoveryTimer));
+  void tick();
 });
 
 // 探测上游有哪些模型可用。候选来自两处并集:

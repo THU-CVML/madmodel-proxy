@@ -2,6 +2,7 @@
 // 背景见 core/thinking.js 文件头:上游逐模型用不同字段名开思考、且各只接受
 // 一组固定档位;1.10.0 的无条件删除导致客户端要的思考被摘掉。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

@@ -124,9 +124,6 @@ const DEFAULT_LIMITS = Object.freeze({ contextWindow: 131072, maxOutputTokens: 6
 // 新模型若出现同类症状,按"Symptoms: 带 tools 被拒 或 默认下不给调用"加入本表
 const TOOLS_UNSUPPORTED = Object.freeze(['qwen3.8-27b']);
 
-// 这类模型**只在流式**下给标记文本(实测 qwen 非流式返回空 content),而代理
-// 本就对上游恒用流式(绕 60s 网关),故天然满足;此处记录该事实以免日后有人
-// 把重发路径改成非流式而踩空
 module.exports = Object.freeze({
   host: '127.0.0.1',
   port: PORT,
@@ -146,7 +143,7 @@ module.exports = Object.freeze({
   },
   // 逐模型上限表 + 未知模型的保守默认。请求路径按**客户端实际选的模型**取
   limitsFor(model) {
-    return MODEL_LIMITS[model] || DEFAULT_LIMITS;
+    return Object.hasOwn(MODEL_LIMITS, model) ? MODEL_LIMITS[model] : DEFAULT_LIMITS;
   },
   // 上游能力元数据,经 /v1/models 暴露给接入的 agent 工具(免得各自猜默认值)。
   // 下面两个是**兼容旧引用**的默认值(探测未完成/未知模型时用),请求路径请走
@@ -182,11 +179,10 @@ module.exports = Object.freeze({
   bodyLimit: 16 * 1024 * 1024,
   bodyTimeout: 60e3,               // 请求体接收完成时限
 
-  // 并发处理硬上限:进程保护(防失控客户端拖垮内存/连接),非常规业务限流;
-  // 64 覆盖多子代理编排的合法负载。刻意不可配置——见 proxy-service 注释
+  // 本地资源保护上限，不代表上游允许的并发量；上游拒绝另按 429 交付。
   inflightHardLimit: 64,
 
-  // 上游超时与限额(并发不受业务层限制,取舍见 core/proxy-service 注释)
+  // 上游超时与响应大小限额。
   // 75s 高于学校网关自身的 60s 超时(2026-09-13/15 两次故障实测:后端死时
   // 精确 60s 返回 504)。设 30s 时我们比学校先放弃——过载期 31~60s 能回的
   // 请求被误杀,后端真死时用户看到我们的含糊 502 而非学校网关的 504。

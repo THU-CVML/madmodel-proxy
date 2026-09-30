@@ -26,3 +26,6 @@ desktop.ini
 # Node
 node_modules/
 npm-debug.log*
+
+# PID 锁竞争记录
+*.lock.holders/

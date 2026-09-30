@@ -6,6 +6,7 @@
 // 无法离线起真实学校端点:本测试注入全局 fetch mock,钉住判据调用的
 // URL 形态、Cookie 携带与状态码映射,防止将来退化回"看表单"。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

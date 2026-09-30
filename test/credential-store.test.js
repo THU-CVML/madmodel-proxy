@@ -2,6 +2,7 @@
 // protect/unprotect 由测试注入(纯字符串变换),经 MADMODEL_STATE_DIR 重定向
 // 到临时目录,离线验证 cipherCookie 写读联与旧记录向后兼容。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

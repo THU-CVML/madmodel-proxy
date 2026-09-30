@@ -5,6 +5,7 @@
 // 清单的可见性语义(回退/发布/降级),路由不变式由 http-server 与
 // proxy-service 的既有测试覆盖
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

@@ -26,6 +26,9 @@ function translateUpstreamError(bodyObj, raw, status, busyHint) {
   const likelyOverflow = hint => hint &&
     (hint.promptTokens + hint.tokenBudget > hint.contextWindow ||
       hint.promptTokens >= hint.contextWindow);
+  if (typeof detail === 'string' && /同时进行中的请求过多|并发(?:请求)?(?:数)?(?:已满|过多|超[出过])/.test(detail)) {
+    return { http: 429, message: '上游并发已满，请稍后重试。' };
+  }
   const overflowMessage = hint =>
     `疑似上下文超限，本地估算输入 ${hint.promptTokens} + 输出预算 ${hint.tokenBudget}，上限 ${hint.contextWindow} tokens。请缩短对话或降低输出预算。`;
 

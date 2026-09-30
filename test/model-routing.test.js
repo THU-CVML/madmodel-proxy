@@ -5,6 +5,7 @@
 // 也不校验收到的 model——等于主契约没有回归钉。若有人日后再把 requestedModel
 // 改回 config.model,所有旧测试仍会全绿(2026-09-28 审阅指出)。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 // 环境注入必须在 require config/paths 之前(加载期读取)。
 // 本文件全程用 mock 上游,**不得依赖真实 token**——否则 token 一过期,

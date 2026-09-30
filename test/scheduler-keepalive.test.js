@@ -3,6 +3,7 @@
 // 完整路由:ok 维持周期、network/探活异常 90s 重探、invalid 触发重签与
 // 90s 复核、重签失败 5 分钟重试、TWO_FACTOR_REQUIRED 上抛。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

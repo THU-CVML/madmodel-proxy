@@ -6,6 +6,7 @@
 //   2. 导出给上游时按根路径匹配,漏掉设在隧道深路径上的会话 cookie。
 // 纯类,离线可测,不需要 fetch。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

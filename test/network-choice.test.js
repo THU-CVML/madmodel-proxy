@@ -2,6 +2,7 @@
 // 启动层网络场景选择:判定优先级矩阵 + 状态文件读写容错。
 // 判定是纯函数(decide),这里只喂输入断言输出——不需要真的启动代理。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

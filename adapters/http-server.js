@@ -14,6 +14,7 @@ const { jwtExpiresAt } = require('../madmodel-auth');
 const credentials = require('../platform/credentials');
 const { atomicWrite } = require('../platform/file-store');
 const { normalizeReasoningDelta } = require('../core/thinking');
+const { getModelMeta } = require('../core/model-registry');
 
 function sendJson(res, status, value, extraHeaders) {
   const body = JSON.stringify(value);
@@ -35,16 +36,13 @@ function openAiError(res, status, message, type, extraHeaders) {
 // token.json 为 DPAPI 加密格式(v1)或旧明文格式。解密要 spawn PowerShell(约百毫秒),
 // 不能每请求做:以"密文记录 mtime"为缓存键——续期进程原子替换文件后 mtime 必变,
 // 变了才重新解密。测试注入(tokenFileInjected)的文件直接走明文 JSON。
-function createTokenCache(config) {
-  let cache = { mtime: 0, data: null };
+function createTokenCache(config, { now = Date.now, readToken = credentials.readToken, negativeTtlMs = 2000 } = {}) {
+  let cache = { mtime: 0, data: null, checkedAt: -Infinity };
   return function getToken() {
     try {
       const stat = fs.statSync(config.tokenFile);
-      // 仅以 mtime 为缓存键(含 null 负结果):token.json 存在但密文永久
-      // 解不开(换账户/损坏)时,每个请求重走 stat+read+DPAPI(同步阻塞
-      // 100-300ms)只为再得到一次 null——负结果同样按 mtime 缓存,用户
-      // 重新 login 原子替换文件、mtime 变化自然失效
-      if (stat.mtimeMs === cache.mtime) {
+      // 成功读取按 mtime 缓存；失败短暂缓存，钥匙串解锁后无需改写文件。
+      if (stat.mtimeMs === cache.mtime && (cache.data || now() - cache.checkedAt < negativeTtlMs)) {
         return cache.data;
       }
       let data;
@@ -55,10 +53,10 @@ function createTokenCache(config) {
         // "瞬态失败"回退上次 token——归因不准。显式判一下,语义是"这份记录不可用"
         if (!data || typeof data !== 'object' || !data.token) data = null;
       } else {
-        data = credentials.readToken(); // 平台解密(DPAPI/钥匙串/机器绑定),坏记录返回 null
+        data = readToken();
       }
       const hadPrevious = !!cache.data;
-      cache = { mtime: stat.mtimeMs, data };
+      cache = { mtime: stat.mtimeMs, data, checkedAt: now() };
       // 热加载可见化:替换既有 token 时打一行日志,确认 watch 续期已被代理接住
       // (首次读取不打——启动横幅已覆盖)
       if (hadPrevious && data?.token) {
@@ -252,7 +250,7 @@ function createHttpServer({ config, service, getToken, modelRegistry }) {
         object: 'list',
         data: source.map(entry => {
           const id = entry.id;
-          const meta = entry.meta || null;
+          const meta = getModelMeta(config, modelRegistry, id);
           // 探测为不可用的条目(通常是配置的目标模型被下架)如实标注:
           // 不填能力字段,避免"广告一个用不了的能力"。客户端据 available
           // 字段可判断它现在发不出请求
@@ -280,12 +278,8 @@ function createHttpServer({ config, service, getToken, modelRegistry }) {
             max_context_length: ctxWin,
             max_output_tokens: maxOut,
             max_tokens: maxOut,
-            // 能力标注(取不到时为 null)。supports_vision 反映上游声明;
-            // 2026-09-28 用户实测三个模型**都**能识图(V4.1 有
-            // multimodal_tokens.image=192 的证据),而 bundle 里 V4.1 标的是
-            // supportImage:false——即**上游声明本身有误**。此处仍发声明值,
-            // 因为覆盖它需要一份"实测能力表"而非猜测(见 CHANGELOG)
-            supports_vision: meta ? meta.supportImage : null,
+            // 视觉能力取上游声明，未知为 null；不代表实测识别质量。
+            supports_vision: meta?.supportImage ?? null,
             // 思考能力标注(1.10.1):上游**逐模型用不同字段名**开思考、且各自
             // 只接受一组固定档位(见 core/thinking.js 的表)。不发布这些,
             // 客户端只能用通用假设去发(ZCode 发 reasoning_effort:"enabled"),

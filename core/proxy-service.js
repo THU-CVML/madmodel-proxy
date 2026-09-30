@@ -6,7 +6,8 @@ const { normalizePayload, parseJsonBody, fitTokenBudget } = require('./payload')
 const { translateUpstreamError, describeFailedStream } = require('./errors');
 const { createAggregator } = require('./completion-aggregator');
 const { getTokenizer } = require('./tokenizer');
-const { parseToolCalls, stripToolMarkup, shouldProbeSwallowedCall } = require('./dsml');
+const { createToolRecovery, toolsForbidden } = require('./tool-recovery');
+const { getModelMeta } = require('./model-registry');
 const { readReasoningDelta, normalizeCompletionReasoning, normalizeReasoningDelta } = require('./thinking');
 
 function stamp() {
@@ -30,76 +31,13 @@ function createProxyService(deps) {
     return typeof m === 'string' ? m.trim() : '';
   }
 
-  function metaFor(model) {
-    try {
-      if (modelRegistry && typeof modelRegistry.snapshot === 'function') {
-        const found = modelRegistry.snapshot().find(m => m && m.id === model);
-        const meta = found && found.meta;
-        if (meta && (meta.thinkingParam === null ||
-            (typeof meta.thinkingParam === 'string' && meta.thinkingParam))) return meta;
-      }
-    } catch (e) { /* 清单异常不该让请求失败:继续走兜底 */ }
-    const fb = config.thinkingFallback;
-    if (fb && typeof fb === 'object' && fb[model]) return fb[model];
-    return null;
-  }
-
+  const metaFor = model => getModelMeta(config, modelRegistry, model);
   const clientAskedTools = payload => Array.isArray(payload?.tools) && payload.tools.length > 0;
+  const recoverTools = createToolRecovery({ config, upstreamClient });
 
-  // Qwen 降级后的 none 来自代理，不能等同于客户端明确禁用工具。
-  const toolsForbidden = payload => {
-    if (payload && payload.__toolsDowngraded) {
-      return payload.__clientToolChoiceNone === true;
-    }
-    const tc = payload?.tool_choice;
-    if (typeof tc === 'string') return tc.trim().toLowerCase() === 'none';
-    if (tc && typeof tc === 'object' && !Array.isArray(tc)) {
-      return typeof tc.type === 'string' && tc.type.trim().toLowerCase() === 'none';
-    }
-    return false;
-  };
-
-  function looksLikeEmptyToolResponse(agg) {
-    const calls = agg.toolCalls;
-    const hasCalls = Array.isArray(calls) ? calls.length > 0 : !!(calls && Object.keys(calls).length);
-    if (hasCalls) return false;                             // 已有结构化调用,不干预
-    if (agg.finish && agg.finish !== 'stop') return false;  // length/content_filter 等不算
-    return true;                                            // 带 tools 却无调用:值得确认
-  }
-
-  // 只重发一次，使用独立超时并响应客户端取消。
-  async function retryForToolCalls(payload, auth, signal) {
-    const retryPayload = { ...payload, stream: false };
-    delete retryPayload.stream_options; // 非流式不需要 usage 注入
-    const ac = new AbortController();
-    const onAbort = () => ac.abort();
-    if (signal) {
-      if (signal.aborted) return null;
-      signal.addEventListener('abort', onAbort, { once: true });
-    }
-    let timer = null;
-    let result;
-    try {
-      result = await Promise.race([
-        upstreamClient.request({
-          payload: retryPayload, token: auth.token, cookie: auth.cookie, signal: ac.signal,
-          headerTimeoutMs: config.toolCallRetryTimeoutMs,
-        }),
-        new Promise(res => {
-          timer = setTimeout(() => { ac.abort(); res({ type: 'timeout', phase: 'total' }); }, config.toolCallRetryTimeoutMs);
-        }),
-      ]);
-    } catch (e) { return null; } finally {
-      if (timer) clearTimeout(timer);
-      if (signal) signal.removeEventListener('abort', onAbort);
-    }
-    if (!result || result.type !== 'completion') return null;
-    const msg = result.body?.choices?.[0]?.message || {};
-    const calls = parseToolCalls(typeof msg.content === 'string' ? msg.content : '', payload.tools);
-    return {
-      toolCalls: calls || [],
-      usage: result.body?.usage,
-    };
+  function errorHeaders(result, status, extraHeaders) {
+    return status === 429 && result.retryAfter
+      ? { ...extraHeaders, 'Retry-After': result.retryAfter } : extraHeaders;
   }
 
   function reportTunnelAuthLost(result) {
@@ -180,7 +118,7 @@ function createProxyService(deps) {
     const hasTools = Array.isArray(payload.tools) && payload.tools.length > 0;
     const rejects = typeof config.rejectsTools === 'function' && config.rejectsTools(model);
     if (!hasTools || !rejects || toolsForbidden(payload)) return;
-    payload.__clientToolChoiceNone = false; // 走到这里说明客户端没要 none
+    payload.__clientToolChoice = payload.tool_choice;
     payload.tool_choice = 'none';
     payload.__toolsDowngraded = true;
   }
@@ -237,18 +175,21 @@ function createProxyService(deps) {
     }
     const budgetNote = fit.note ? ` 输出预算 ${payload.max_tokens}` : '';
 
-    if (inflight >= config.inflightHardLimit) {
-      logReq(ctx.req, 429, ctx.started, ctx.size, `并发已满 ${inflight}/${config.inflightHardLimit}`, payload.model);
-      return ctx.sendError(429,
-        `并发请求已达上限 ${config.inflightHardLimit}，请降低并发或稍后重试。`,
-        'rate_limit');
-    }
-
     const ac = ctx.abortController;
     let inflightHeld = false;
-    const hold = () => { if (!inflightHeld) { inflightHeld = true; inflight++; } };
+    const hold = () => {
+      if (inflightHeld) return true;
+      if (inflight >= config.inflightHardLimit) {
+        logReq(ctx.req, 429, ctx.started, ctx.size, `并发已满 ${inflight}/${config.inflightHardLimit}`, payload.model);
+        ctx.sendError(429, `并发请求已达上限 ${config.inflightHardLimit}，请降低并发或稍后重试。`, 'rate_limit');
+        return false;
+      }
+      inflightHeld = true;
+      inflight++;
+      return true;
+    };
     const release = () => { if (inflightHeld) { inflightHeld = false; inflight--; } };
-    hold();
+    if (!hold()) return;
     try {
       const attempt = a => clientWantsStream
         ? streamPassthrough(ctx, payload, a, extraHeaders, budgetNote, ac, contextWindow)
@@ -260,7 +201,7 @@ function createProxyService(deps) {
           const fresh = await sharedCredentialWait(auth.token, auth.cookie);
           if (ctx.clientGone()) return;
           if (fresh) {
-            hold();
+            if (!hold()) return;
             logReq(ctx.req, 100, ctx.started, ctx.size, '凭据已更新，重试中');
             const a2 = { token: fresh.token, cookie: fresh.cookie };
             const r2 = await attempt(a2);
@@ -391,7 +332,7 @@ function createProxyService(deps) {
         ctx.dumpFailed();
         const mapped = translateUpstreamError(result.body, result.raw, result.status, busyHint(payload, contextWindow));
         logReq(req, mapped.http, started, size, mapped.message, servedModel);
-        return ctx.sendError(mapped.http, mapped.message, 'upstream_error', extraHeaders);
+        return ctx.sendError(mapped.http, mapped.message, 'upstream_error', errorHeaders(result, mapped.http, extraHeaders));
       }
       ctx.endResponse();
       logReq(req, 200, started, size, `回复中断 ${String(
@@ -413,36 +354,26 @@ function createProxyService(deps) {
       }
       return failRequest(ctx, mapped);
     }
-    let recoveryNote = '';
-    let retryUsage;
-    const evidenceText = bufferedText + bufferedReasoning;
-    if (result.type === 'stream' && bufferFrames && !sawStructured &&
-        !toolsForbidden(payload) &&
-        (!streamFinish || streamFinish === 'stop') &&
-        shouldProbeSwallowedCall(evidenceText)) {
-      const inline = parseToolCalls(bufferedText, payload.tools);
-      if (inline) {
-        const prose = stripToolMarkup(bufferedText);
-        await writeRecovered(ctx, servedModel, inline, prose, result.usage);
-        logReq(req, 200, started, size,
-          `工具调用 ${inline.length}（文本恢复）${budgetNote}${usageNote(result.usage)}`, servedModel);
-        return;
-      }
-      const fixed = await retryForToolCalls(payload, auth, ac.signal);
+    let recovery = {};
+    let originalUsage = result.usage;
+    if (result.type === 'stream' && bufferFrames && !sawStructured) {
+      const body = { choices: [{ message: { content: bufferedText, reasoning_content: bufferedReasoning },
+        finish_reason: streamFinish }], usage: result.usage };
+      recovery = await recoverTools(body, payload, auth, ac.signal, streamThinkingField);
       if (ctx.clientGone()) return;
-      retryUsage = fixed?.usage;
-      if (fixed?.toolCalls.length) {
-        await writeRecovered(ctx, servedModel, fixed.toolCalls, '', fixed.usage);
+      if (recovery.recovered) {
+        const msg = body.choices[0].message;
+        await writeRecovered(ctx, servedModel, msg.tool_calls, msg.content, body.usage);
         logReq(req, 200, started, size,
-          `工具调用 ${fixed.toolCalls.length}（重试恢复）${budgetNote}${usageNote(result.usage, retryUsage)}`, servedModel);
+          `${recovery.note}${budgetNote}${usageNote(originalUsage, recovery.retryUsage)}`, servedModel);
         return;
       }
-      await flushBuffer();
-      recoveryNote = '工具恢复未成功，返回原回复';
-    } else if (bufferFrames && buffered.length) {
-      await flushBuffer();
     }
+    await flushBuffer();
     if (result.type === 'completion') {
+      originalUsage = result.body.usage;
+      recovery = await recoverTools(result.body, payload, auth, ac.signal, streamThinkingField);
+      if (ctx.clientGone()) return;
       const m = result.body.choices?.[0]?.message || {};
       const fbReasoning = readReasoningDelta(m, streamThinkingField);
       const chunk = {
@@ -473,13 +404,13 @@ function createProxyService(deps) {
       }
       await ctx.writeSseLine('data: [DONE]\n\n');
       ctx.endResponse();
-      logReq(req, 200, started, size, `流式${budgetNote}${usageNote(result.body?.usage)}`, servedModel);
+      logReq(req, 200, started, size, `${recovery.note || '流式'}${budgetNote}${usageNote(originalUsage, recovery.retryUsage)}`, servedModel);
       return;
     }
     if (ctx.sseHeadersSent()) {
       await ctx.writeSseLine('data: [DONE]\n\n');
       ctx.endResponse();
-      logReq(req, 200, started, size, `${recoveryNote || '流式'}${budgetNote}${usageNote(result.usage, retryUsage)}`, servedModel);
+      logReq(req, 200, started, size, `${recovery.note || '流式'}${budgetNote}${usageNote(originalUsage, recovery.retryUsage)}`, servedModel);
     } else {
       logReq(req, 502, started, size, '上游返回空流', servedModel);
       ctx.sendError(502, '上游返回空流');
@@ -500,14 +431,13 @@ function createProxyService(deps) {
         ctx.sendError(504, `生成超时（${config.nonstreamTotalTimeout / 1000}s），请缩短对话或改用流式。`);
       }
     }, config.nonstreamTotalTimeout);
-    const result = await upstreamClient.request({
-      payload, token: auth.token, cookie: auth.cookie, signal: ac.signal,
-      onChunk: obj => {
-        chunkCount++;
-        agg.feed(obj);
-      },
-    });
-    clearTimeout(timer);
+    let result;
+    try {
+      result = await upstreamClient.request({
+        payload, token: auth.token, cookie: auth.cookie, signal: ac.signal,
+        onChunk: obj => { chunkCount++; agg.feed(obj); },
+      });
+    } finally { clearTimeout(timer); }
 
     if (timedOut) { // 504 已由定时器发出,这里只补日志
       logReq(req, 504, started, size, '生成超时，请缩短对话或改用流式', payload.model);
@@ -527,7 +457,7 @@ function createProxyService(deps) {
       ctx.dumpFailed();
       const mapped = translateUpstreamError(result.body, result.raw, result.status, busyHint(payload, contextWindow));
       logReq(req, mapped.http, started, size, mapped.message, payload.model);
-      return ctx.sendError(mapped.http, mapped.message, 'upstream_error', extraHeaders);
+      return ctx.sendError(mapped.http, mapped.message, 'upstream_error', errorHeaders(result, mapped.http, extraHeaders));
     }
     const mapped = mapResult(result, 'agg');
     if (mapped) {
@@ -537,52 +467,17 @@ function createProxyService(deps) {
       }
       return failRequest(ctx, mapped);
     }
-    if (result.type === 'completion') {
-      normalizeCompletionReasoning(result.body, aggThinkingField);
-      logReq(req, 200, started, size, `完成${budgetNote}${usageNote(result.body.usage)}`, payload.model);
-      return ctx.sendJson(200, result.body, extraHeaders);
-    }
-    if (chunkCount === 0) {
+    if (result.type !== 'completion' && chunkCount === 0) {
       logReq(req, 502, started, size, '上游返回空流', payload.model);
       return ctx.sendError(502, '上游返回空流');
     }
-    let recoveryNote = '';
-    let retryUsage;
-    if (config.toolCallFix && clientAskedTools(payload) && !toolsForbidden(payload)) {
-      const aggView = { content: agg.content, toolCalls: agg.toolCalls, finish: agg.finish };
-      const evidenceText = (agg.content || '') + (agg.reasoning || '');
-      if (looksLikeEmptyToolResponse(aggView)) {
-        const inline = parseToolCalls(agg.content || '', payload.tools);
-        if (inline) {
-          const out1 = agg.result();
-          out1.choices[0].message.content = stripToolMarkup(out1.choices[0].message.content || '') || null;
-          out1.choices[0].message.tool_calls = inline;
-          out1.choices[0].finish_reason = 'tool_calls';
-          logReq(req, 200, started, size,
-            `工具调用 ${inline.length}（文本恢复）${budgetNote}${usageNote(agg.usage)}`, payload.model);
-          return ctx.sendJson(200, out1, extraHeaders);
-        }
-        const attempted = shouldProbeSwallowedCall(evidenceText);
-        const fixed = attempted
-          ? await retryForToolCalls(payload, auth, ac.signal)
-          : null;
-        if (ctx.clientGone()) return;
-        retryUsage = fixed?.usage;
-        if (fixed?.toolCalls.length) {
-          const out2 = agg.result();
-          out2.choices[0].message.tool_calls = fixed.toolCalls;
-          out2.choices[0].finish_reason = 'tool_calls';
-          if (fixed.usage) out2.usage = fixed.usage;
-          logReq(req, 200, started, size,
-            `工具调用 ${fixed.toolCalls.length}（重试恢复）${budgetNote}${usageNote(agg.usage, retryUsage)}`, payload.model);
-          return ctx.sendJson(200, out2, extraHeaders);
-        } else if (attempted) {
-          recoveryNote = '工具恢复未成功，返回原回复';
-        }
-      }
-    }
-    const out = agg.result();
-    logReq(req, 200, started, size, `${recoveryNote || '完成'}${budgetNote}${usageNote(agg.usage, retryUsage)}`, payload.model);
+    const out = result.type === 'completion' ? result.body : agg.result();
+    normalizeCompletionReasoning(out, aggThinkingField);
+    const originalUsage = result.type === 'completion' ? out.usage : agg.usage;
+    const recovery = await recoverTools(out, payload, auth, ac.signal, aggThinkingField);
+    if (ctx.clientGone()) return;
+    logReq(req, 200, started, size,
+      `${recovery.note || '完成'}${budgetNote}${usageNote(originalUsage, recovery.retryUsage)}`, payload.model);
     ctx.sendJson(200, out, extraHeaders);
   }
 

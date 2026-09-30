@@ -9,6 +9,7 @@
 //
 // 注入 fetchImpl 全程离线,不访问学校服务(同 update-check.test.js 的范式)。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

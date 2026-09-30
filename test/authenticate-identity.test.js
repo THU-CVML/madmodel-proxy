@@ -8,6 +8,7 @@
 //   3. 成功判据(响应体含 ticket= 时从 <a href> 提取跳转地址)
 // fetch mock 全程离线,不访问学校服务。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

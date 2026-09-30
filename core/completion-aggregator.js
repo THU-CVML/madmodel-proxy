@@ -10,7 +10,7 @@ function createAggregator(model = '', thinkingField = null) {
   return {
     id: '', model,
     content: '', reasoning: '',
-    toolCalls: {}, // index → {id, type, function:{name, arguments}}
+    toolCalls: Object.create(null), // index → {id, type, function:{name, arguments}}
     finish: null, usage: null, created: 0,
     feed(obj) {
       if (obj.id) this.id = obj.id;
@@ -30,6 +30,11 @@ function createAggregator(model = '', thinkingField = null) {
       if (Array.isArray(d.tool_calls)) {
         for (const tc of d.tool_calls) {
           const i = tc.index != null ? tc.index : 0;
+          if (!Number.isSafeInteger(i) || i < 0) {
+            const error = new Error('上游工具调用索引无效');
+            error.code = 'UPSTREAM_TOOL_INDEX';
+            throw error;
+          }
           if (!this.toolCalls[i]) this.toolCalls[i] = { id: '', type: 'function', function: { name: '', arguments: '' } };
           if (tc.id) this.toolCalls[i].id = tc.id;
           if (tc.function) {

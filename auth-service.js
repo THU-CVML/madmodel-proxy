@@ -13,13 +13,14 @@ const processLock = require('./platform/process-lock');
 const { createFileWakeup } = require('./platform/file-store');
 const { Scheduler } = require('./core/scheduler');
 const config = require('./config');
+const { isProxyRunning } = require('./core/proxy-status');
 const { TOKEN_FILE, CREDS_FILE, WATCH_LOCK, AUTH_LOCK, TUNNEL_REVIVE } = require('./platform/paths');
 
 // 认证操作锁(login/once 与 watch 续期共用):用户手动 login 时 watch 恰好在
 // 走登录链,会触发重复二次认证且 token 互相覆盖。watch 抢不到锁按瞬时错误
 // 短退避重试(scheduler 的 AUTH_BUSY 分支),人工操作不受影响
 async function withAuthLock(fn) {
-  const r = processLock.acquirePidLock(AUTH_LOCK);
+  const r = await processLock.acquirePidLock(AUTH_LOCK);
   if (!r.ok) {
     const e = new Error(`另一认证操作进行中(PID ${r.pid}),请稍后重试`);
     e.code = 'AUTH_BUSY';
@@ -101,20 +102,8 @@ function stamp() {
 // 只支持停服后清理,不做代停(进程身份确认与停止顺序的复杂度留给真实
 // 需要时)。远端不撤销:学校侧登录状态活到自然过期(约 6 小时)
 async function logout() {
-  // ① 代理在跑?(/v1/models 健康探测,与 start.cmd 同一判定)
-  try {
-    const r = await fetch(`http://127.0.0.1:${config.port}/v1/models`, { signal: AbortSignal.timeout(2000) });
-    const j = await r.json().catch(() => null);
-    if (r.status === 200 && Array.isArray(j?.data)) {
-      const e = new Error('代理仍在运行。请先用 Ctrl+C 停止代理与续期守护,再执行 logout');
-      // 不挂 e.code:cli 的通用兜底会把 code 打成 [XXX] 前缀进用户可见输出
-      e.serviceRunning = true;
-      throw e;
-    }
-  } catch (e) {
-    // 按标记判定,不匹配错误文案(文案是给人改的,改一次词就静默失效)
-    if (e.serviceRunning) throw e; // 自身的指引错误原样上抛
-    /* 探测失败 = 未运行,继续 */
+  if (await isProxyRunning(config.port)) {
+    throw new Error('代理仍在运行。请先用 Ctrl+C 停止代理与续期守护，再执行 logout');
   }
   // ② watch 在跑?(锁 PID 探活)
   try {
@@ -142,7 +131,7 @@ async function logout() {
 // watch 守护:单实例锁 + 调度器装配。锁的争用与提示属 CLI 决策,留在本层
 let activeScheduler = null;
 async function watch() {
-  const lock = processLock.acquirePidLock(WATCH_LOCK);
+  const lock = await processLock.acquirePidLock(WATCH_LOCK);
   if (!lock.ok) {
     console.error(`续期服务已在运行（PID ${lock.pid}），跳过启动。`);
     process.exit(0);

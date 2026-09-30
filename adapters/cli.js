@@ -12,6 +12,7 @@ const { login, refresh, watch, logout } = require('../auth-service');
 const credentials = require('../platform/credentials');
 const processLock = require('../platform/process-lock');
 const config = require('../config');
+const { isProxyRunning } = require('../core/proxy-status');
 const { WATCH_LOCK, display } = require('../platform/paths');
 
 // 密码逐键输入的状态机(纯函数,便于测试)。原实现把这段逻辑内联在
@@ -200,17 +201,7 @@ async function cmdOnce() {
 
 // 一屏状态:代理/token/watch/key 四问四答。全部只读,可随时运行。
 async function cmdStatus() {
-  // 1) 代理:/v1/models 在鉴权之前、无需 key;响应里带本代理特有的 owned_by
-  //    即确认是本代理在监听(而非端口被其他程序占用)。**不比对模型名**:
-  //    上游更名后 config.model 与在跑的代理可能不同步,那时按模型名判会
-  //    误报"未运行"(2026-09-27 上游下架 DeepSeek-V4-Flash-0731 时实测到
-  //    这类失效);owned_by 是本代理自己写死的标识,不随上游变
-  let proxyUp = false;
-  try {
-    const r = await fetch(`http://127.0.0.1:${config.port}/`, { signal: AbortSignal.timeout(2000) });
-    const j = await r.json().catch(() => null);
-    proxyUp = r.status === 200 && j?.proxy === 'madmodel';
-  } catch (e) { /* 未运行/超时/非本代理 */ }
+  const proxyUp = await isProxyRunning(config.port);
   console.log('代理: ' + (proxyUp ? `运行中 → http://127.0.0.1:${config.port}/v1` : '未运行（运行 npm start 启动）'));
 
   // 2) token:三态口径与代理启动横幅一致

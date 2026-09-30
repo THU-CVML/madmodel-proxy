@@ -11,6 +11,7 @@
 // 触发(不误伤正常对话/正常工具响应/无 tools 请求)③ 解析不出时不伪造
 // ④ 关掉开关时恢复纯透传。全程 mock 上游,不访问学校服务。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 // 环境注入必须在 require config/paths 之前(加载期读取)
 const fs = require('fs');

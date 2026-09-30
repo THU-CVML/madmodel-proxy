@@ -5,6 +5,7 @@
 // AES-256-GCM)上属于事实错误的安全承诺。钉住三平台文案,并确认 Windows 文案
 // 与修复前逐字相同(平台提示的其余文字不在本测试的管辖内)。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

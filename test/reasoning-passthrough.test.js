@@ -8,6 +8,7 @@
 // 复现的是 2026-09-29 实测形态:qwen 的 delta 键是 role,content,**reasoning**
 // (逐字抄自抓到的上游真实帧),而客户端只认 reasoning_content。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const fs = require('fs');
 const os = require('os');

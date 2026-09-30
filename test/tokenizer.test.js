@@ -6,6 +6,7 @@
 // 上游漂移需重新以 usage.prompt_tokens 对测(勘误:此前版本在此宣称会红,
 // 系表述错误)。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

@@ -1,6 +1,7 @@
 // Qwen 缓存隔离:检查真实 HTTP 出口,包括同一 payload 重用与工具补救重发。
 // 全程使用本地假上游,不读取凭据、不访问学校服务。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert/strict');

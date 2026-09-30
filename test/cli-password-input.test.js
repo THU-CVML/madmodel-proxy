@@ -5,6 +5,7 @@
 // 倒有三条测试(2026-09-21 审阅指出的不对称)。抽成纯函数后,把这几类输入
 // 逐个钉住,防止"修 A 引入 B"再次发生(逐码点修好粘贴,却引入方向键污染)。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

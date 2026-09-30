@@ -1,6 +1,7 @@
 // test/payload.test.js — 请求解析与归一化(纯函数)。
 // 与真实流量冒烟的分工:这里只测纯逻辑边界,协议行为靠 smoke-real.js
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

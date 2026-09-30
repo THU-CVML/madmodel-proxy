@@ -7,6 +7,7 @@
 // before/after 钩子——Node 18 的 node:test 根级钩子不生效(18.14.2 CI 实测,
 // 测试带着未初始化的装配直接开跑),t.test 子测试全版本可靠
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 // 环境注入必须在 require config/paths 之前(加载期读取)
 const fs = require('fs');

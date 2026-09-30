@@ -98,7 +98,40 @@ async function discoverWithCredentials({ getCredentials, probe, wait = ms => new
   return first;
 }
 
-module.exports = { probeModel, describeProbeFailure, MODEL_NOT_FOUND, parseModelList, discoverModels, formatModelTable, discoverWithCredentials };
+// 延迟到有效凭据出现后探测。失败凭据不反复探测，凭据更新后可重试。
+function createDiscoveryRunner({ getCredentials, probe, publish, now = Date.now, wait }) {
+  let running = null;
+  let attempted = null;
+  let complete = false;
+  const keyOf = c => `${c.token}\u0000${c.cookie || ''}`;
+  function tick() {
+    if (complete || running) return running || Promise.resolve();
+    const credentials = getCredentials();
+    if (!credentials?.token || !(credentials.expiresAt > now())) return Promise.resolve();
+    const key = keyOf(credentials);
+    if (attempted === key) return Promise.resolve();
+    attempted = key;
+    // 先登记 Promise，再执行外部回调，避免同步重入产生重复探测。
+    running = Promise.resolve().then(() => discoverWithCredentials({
+      getCredentials,
+      probe: c => {
+        if (!c?.token || !(c.expiresAt > now())) return Promise.resolve([]);
+        attempted = keyOf(c);
+        return probe(c);
+      },
+      wait,
+    })).then(results => {
+      if (!results.length) return;
+      complete = !results.every(r => !r.ok && r.reason === 'session');
+      publish(results);
+    }).catch(() => { /* 探测故障不影响代理请求；凭据更新后可重试 */ })
+      .finally(() => { running = null; });
+    return running;
+  }
+  return { tick, get complete() { return complete; } };
+}
+
+module.exports = { probeModel, describeProbeFailure, MODEL_NOT_FOUND, parseModelList, discoverModels, formatModelTable, discoverWithCredentials, createDiscoveryRunner };
 
 function parseModelList(source) {
   if (typeof source !== 'string' || !source) return null;
@@ -131,15 +164,13 @@ function parseModelList(source) {
     };
     const id = pick('value');
     if (typeof id !== 'string' || !id) continue;
-    const thinkingParam = pick('thinkingParam');
-    const thinkingField = pick('thinkingField');
     models.push({
       id,
       label: label || id,
-      supportImage: pick('supportImage') === true,
-      thinkingParam: thinkingParam === undefined ? undefined : thinkingParam,
-      thinkingField: thinkingField === undefined ? undefined : thinkingField,
-      effortOptions: pick('effortOptions') || [],
+      supportImage: pick('supportImage'),
+      thinkingParam: pick('thinkingParam'),
+      thinkingField: pick('thinkingField'),
+      effortOptions: pick('effortOptions'),
     });
   }
   return models.length ? models : null;

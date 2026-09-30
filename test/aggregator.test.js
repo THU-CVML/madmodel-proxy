@@ -1,6 +1,7 @@
 // test/aggregator.test.js — 非流式聚合(纯函数):delta 拼接、tool_calls 组装、
 // 结果形态。与真实流量冒烟的分工见 smoke-real.js
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

@@ -1,6 +1,7 @@
 // test/paths.test.js — 状态目录迁移(旧 .dsh-madmodel → .madmodel-proxy)纯函数行为。
 // 经 MADMODEL_STATE_DIR 重定向隔离,不触碰真实凭据;直接测 migrateStateDir
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

@@ -1,6 +1,7 @@
 // test/errors.test.js — 错误分类与映射(纯函数):结构化状态码、SSE 内嵌
 // errorMessage、HTML 错误页、无法识别兜底,与 failed-stream 措辞
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

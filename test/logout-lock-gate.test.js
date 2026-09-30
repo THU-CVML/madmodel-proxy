@@ -6,6 +6,7 @@
 // paths.js 在 require 时读取环境变量,故用子进程 + MADMODEL_STATE_DIR 隔离
 // 状态目录,不碰本机真实凭据。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');
@@ -22,12 +23,12 @@ function runInStateDir(setup, script) {
   try {
     setup(dir);
     const runner = path.join(dir, 'runner.js');
-    fs.writeFileSync(runner, script);
+    fs.writeFileSync(runner, 'globalThis.fetch = async () => ({ status: 200, json: async () => ({ proxy: "other" }) });\n' + script);
     try {
       const stdout = execFileSync(process.execPath, [runner], {
         cwd: ROOT,
         encoding: 'utf8',
-        env: Object.assign({}, process.env, { MADMODEL_STATE_DIR: dir }),
+        env: require('../scripts/isolated-env').createTestEnv(dir),
         timeout: 20000,
         stdio: ['ignore', 'pipe', 'pipe'],
       });

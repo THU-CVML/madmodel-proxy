@@ -26,4 +26,14 @@ function createModelRegistry(config) {
     },
   };
 }
-module.exports = { createModelRegistry };
+// 列表与请求使用相同的有效能力；缺失字段回退，显式 null 保留。
+function getModelMeta(config, registry, model) {
+  const fallback = config.thinkingFallback;
+  const base = fallback && Object.hasOwn(fallback, model) ? fallback[model] : null;
+  let remote;
+  try { remote = registry?.snapshot().find(m => m.id === model)?.meta; } catch { /* 使用本地回退 */ }
+  if (!base && !remote) return null;
+  return { ...base, ...Object.fromEntries(Object.entries(remote || {}).filter(([, value]) => value !== undefined)) };
+}
+
+module.exports = { createModelRegistry, getModelMeta };

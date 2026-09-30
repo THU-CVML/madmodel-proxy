@@ -8,6 +8,7 @@
 // ——redactUrl 只处理展示文本,改了请求就断链。
 // fetch 全程 mock,不访问学校服务。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

@@ -22,9 +22,12 @@ npm start
 
 - `npm test`：本地离线测试（单元 + mock 上游集成）。CI 在 Ubuntu 上用 Node 18.14/20/24 跑完整测试（Node 18.14 按文件运行以绕过 Node 18 TAP 解析器问题）；三平台另用 Node 24 跑 `platform-smoke`
 - `node scripts/platform-smoke.js`：跨平台存储/启动冒烟（独立状态目录与钥匙串命名空间，不触碰真实凭据，不访问学校服务）
+
 - 改动 SSE 解析、错误处理、超时这类协议行为后，跑 `npm run smoke` 做真实流量冒烟（需要代理在线、有效 token、消耗少量配额）——mock 测不出真实网关的形态
 - `npm run check:release`：检查待发布文件；新增源码必须已纳入 Git。审阅未暂存改动时可用 `node scripts/release-check.js --worktree`，该模式不会声称已验证提交内容
 - PR 描述里写清楚改了什么行为、跑过上面哪几层验证
+
+新测试在加载产品模块前调用 `require('../scripts/isolated-env').isolate()`。子进程用 `createTestEnv()` 创建环境，避免继承用户的凭据路径、上游地址或钥匙串配置。
 
 ## 提 Issue
 

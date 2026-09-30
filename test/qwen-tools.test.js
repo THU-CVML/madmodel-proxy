@@ -12,6 +12,7 @@
 //   ③ 内部标记不外泄到上游
 //   ④ 其它模型不被降级(V4.1 原生路径不受影响)
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const fs = require('fs');
 const os = require('os');

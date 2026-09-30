@@ -86,6 +86,7 @@ if (tracked) {
   } else {
     ok('状态目录(.madmodel-proxy/ 及旧名 .dsh-madmodel/)未被跟踪');
   }
+  if (tracked.some(f => /\.lock\.holders\//.test(f))) fail('PID 锁竞争目录被 Git 跟踪');
 }
 
 // 校验随仓库分发的第三方文件，避免意外改写或截断。
@@ -117,7 +118,7 @@ if (!match) {
 // 5) .gitignore 覆盖防御性兜底
 const gitignore = fs.readFileSync(path.join(root, '.gitignore'), 'utf8');
 for (const rule of ['node_modules/', 'token.json', 'creds.json', 'api-key',
-  'last-failed-request.json', '*.tmp']) {
+  'last-failed-request.json', '*.tmp', '*.lock.holders/']) {
   if (gitignore.includes(rule)) ok(`.gitignore 覆盖: ${rule}`);
   else fail(`.gitignore 缺少规则: ${rule}`);
 }
