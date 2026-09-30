@@ -32,6 +32,7 @@
 
 'use strict';
 
+const { randomUUID } = require('crypto');
 const { SseParser } = require('./stream-parser');
 
 // 限量读:错误页/直答异常膨胀时及时放弃,不无限缓冲(超限抛 UPSTREAM_BODY_LIMIT)
@@ -54,6 +55,24 @@ async function readLimited(reader, limit) {
   return Buffer.concat(parts);
 }
 
+// 剔除代理内部字段(`__` 前缀),再序列化发往上游。这些字段是代理各层之间传递
+// 状态的约定(如 payload.__toolsDowngraded 标记"tool_choice 是代理降级设置的,
+// 不同于客户端要求的 none"),**不应外泄给上游**:上游对未知字段的反应未经实测。
+//
+// 放在这里而不是各调用点:本函数是唯一的序列化出口,一处覆盖流式、非流式、
+// 重发全部路径。原对象不变(返回浅拷贝),故调用方仍能读到自己的标记
+function stripInternalFields(payload) {
+  if (!payload || typeof payload !== 'object') return payload;
+  let out = null;
+  for (const k of Object.keys(payload)) {
+    if (k.startsWith('__')) {
+      if (!out) out = { ...payload };
+      delete out[k];
+    }
+  }
+  return out || payload;
+}
+
 function createUpstreamClient(config) {
   const {
     upstream, tunnelMode,
@@ -61,7 +80,12 @@ function createUpstreamClient(config) {
     upstreamJsonBodyLimit, upstreamSseTotalLimit, sseLineLimit,
   } = config;
 
-  function request({ payload, token, cookie, signal, onChunk, onOpen }) {
+  // headerTimeoutMs 可由调用方覆盖:工具调用补救的非流式重发需要比常规请求
+  // 更长的头超时——常规 streamIdle/header 超时是按"绕学校 60s 网关"设计的,
+  // 而补救重发是在**已经失败**的路径上补一次,值得多等(实测冷启动首字节可到
+  // 70.5s,与默认 75s 头超时贴得太近,冷启动时会被误掐,导致补救取不到内容)
+  function request({ payload, token, cookie, signal, onChunk, onOpen, headerTimeoutMs }) {
+    const headerTimeout = Number.isFinite(headerTimeoutMs) ? headerTimeoutMs : upstreamHeaderTimeout;
     return new Promise((resolve) => {
       // 零字节截断时"已等待多久"的计时起点(见 truncated 结果的 idleMs)
       const requestStart = Date.now();
@@ -69,9 +93,10 @@ function createUpstreamClient(config) {
       // 都汇入这里;idle/total 超时经 cancelBody 令读取循环结束。
       // 不用 AbortSignal.any:手动桥接对所有 Node 版本一致,且已覆盖 aborted 初态
       const lifecycle = new AbortController();
+      const onAbort = () => lifecycle.abort();
       if (signal) {
         if (signal.aborted) lifecycle.abort();
-        else signal.addEventListener('abort', () => lifecycle.abort(), { once: true });
+        else signal.addEventListener('abort', onAbort, { once: true });
       }
 
       let settled = false;
@@ -87,6 +112,7 @@ function createUpstreamClient(config) {
         clearTimeout(headerTimer);
         clearTimeout(idleTimer);
         clearTimeout(totalTimer);
+        if (signal) signal.removeEventListener('abort', onAbort);
         resolve(v);
       };
       const cancelBody = () => {
@@ -105,15 +131,22 @@ function createUpstreamClient(config) {
           finish({ type: 'timeout', phase: 'idle' });
         }, streamIdleTimeout);
       };
-      // 响应头超时:TCP/TLS/代理层挂住时 30s 放弃,不长期占用并发槽
+      // 响应头超时:TCP/TLS/代理层挂住时放弃,不长期占用并发槽
       // (空闲计时器只覆盖"收到响应后";这里覆盖"发出请求到响应头"的窗口)
+      // 默认 upstreamHeaderTimeout(75s,高于学校网关 60s);补救重发可经
+      // headerTimeoutMs 覆盖(见 request 参数注释)
       headerTimer = setTimeout(() => {
         lifecycle.abort(); // abort() 无抛出路径;中止尚未建立的连接
         cancelBody();
         finish({ type: 'timeout', phase: 'headers' });
-      }, upstreamHeaderTimeout);
+      }, headerTimeout);
 
       (async () => {
+        // 请求体明文直发,不做 gzip。1.4.1 之前压缩过,为绕上游 WAF 的 SQL
+        // 注入特征规则:它误拦含字面量 "(set " 的明文请求体(agent 工具的
+        // 系统提示词常见),症状是 404 + 一串 SPA HTML。上游 2026-09-08 移除
+        // 该规则后规避删除(完整实现见 git 历史 b377a5e)。若 404 + HTML 再现,
+        // 先按"提示词内容被 WAF 拦"查,而不是先怀疑端点变更
         const reqHeaders = {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
@@ -125,10 +158,17 @@ function createUpstreamClient(config) {
         // 回传给签发它的 origin)
         if (cookie && tunnelMode) reqHeaders.Cookie = cookie;
 
+        let outgoingPayload = stripInternalFields(payload);
+        if (typeof config.isolateCacheFor === 'function' && config.isolateCacheFor(payload?.model)) {
+          // 每次实际发送时生成,覆盖正常请求与补救重发。客户端提供的固定 salt
+          // 也必须替换:重用它仍会命中异常缓存。只改发送副本,避免给重试共享的
+          // 原 payload 留下缓存状态;消息、工具及采样参数均保持原值。
+          outgoingPayload = { ...outgoingPayload, cache_salt: randomUUID() };
+        }
         const up = await fetch(upstream, {
           method: 'POST',
           headers: reqHeaders,
-          body: Buffer.from(JSON.stringify(payload), 'utf8'),
+          body: Buffer.from(JSON.stringify(outgoingPayload), 'utf8'),
           redirect: 'manual',
           signal: lifecycle.signal,
         });

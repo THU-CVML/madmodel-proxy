@@ -184,7 +184,7 @@ test('询问文案:两个选项都在,且不得声称"回车即默认"', () => {
   const all = nc.PROMPT_LINES.join('\n');
   assert.match(all, /校园网/, '缺校园网选项');
   assert.match(all, /校外/, '缺校外选项');
-  assert.match(all, /不再询问/, '缺"不再询问"的说明');
+  assert.match(all, /会保存/, '缺保存选择的说明');
   // choice 只认 /c 里列出的键,回车不是合法键——所以"无输入=默认"只能靠
   // /t 超时实现,文案里说"回车即选中默认"是假的
   assert.doesNotMatch(all, /回车/, '提示不得声称回车即默认(choice 不接受回车)');

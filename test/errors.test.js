@@ -30,15 +30,26 @@ test('映射: status 10001 → 429,带/不带详情两种形态', () => {
   const withDetail = translateUpstreamError({ status: 10001, message: '模型不存在' }, '', 200);
   assert.strictEqual(withDetail.http, 429);
   assert.ok(withDetail.message.includes('模型不存在'));
+  // 给出可能原因,让用户能自己缩小范围(上下文/请求体/真繁忙)
+  assert.ok(withDetail.message.includes('请求参数'));
   const noDetail = translateUpstreamError({ status: 10001 }, '', 200);
   assert.strictEqual(noDetail.http, 429);
-  assert.ok(noDetail.message.includes('上游未提供详情'));
+  assert.ok(noDetail.message.includes('未提供详情'), '上游没给详情时要如实说明,不能装作有细节');
 });
 
 test('映射: SSE 内嵌 errorMessage 含"繁忙" → 429 原文', () => {
   const m = translateUpstreamError({ errorMessage: '服务器繁忙，请稍后再试' }, '', 200);
   assert.strictEqual(m.http, 429);
   assert.ok(m.message.includes('服务器繁忙'));
+});
+
+test('映射: 上游网关 413(HTML 错误页) → 413 且给出减体积的处置', () => {
+  const m = translateUpstreamError(null, '<html><title>413 Request Entity Too Large</title></html>', 413);
+  assert.strictEqual(m.http, 413, '体积问题应如实回 413,不是 502');
+  // 网关上限会变(2026-09-28 一天内从 1MiB 提到 5MB 以上),文案不得写死数字
+  assert.ok(!/KB|MB|字节数|1,048|1048576/.test(m.message), '不得在文案里钉死会变的上限:' + m.message);
+  assert.ok(m.message.includes('图'), '应指出图片是最常见的触发原因:' + m.message);
+  assert.ok(!/稍后重试通常自愈/.test(m.message), '体积超限重试无用,不得给这个建议');
 });
 
 // ---- "繁忙"复判:上游对上下文超限也报"繁忙"(2026-09-10 实测),按本地精确
@@ -142,7 +153,7 @@ test('截断两形态: 零字节且等待达网关墙 → 首字节文案(维护
   assert.strictEqual(d.note, 'stream-truncated');
   assert.ok(d.message.includes('未产出首字节'), d.message);
   assert.ok(d.message.includes('等待后重试'), d.message);
-  assert.ok(d.message.includes('减小会话上下文'), d.message);
+  assert.ok(d.message.includes('缩短对话'), d.message);
   // 定稿文案不再带秒数/网关归因/直连建议——排障信息由日志的 idle=Ns 承载
   assert.ok(!d.message.includes('PROXY_UPSTREAM'), d.message);
 });
@@ -155,8 +166,8 @@ test('截断两形态: 中途截断 → 距上一帧时长 + 已交付 KB + 可�
   assert.ok(d.message.includes('截断'), d.message);          // README FAQ 按"截断"检索
   assert.ok(d.message.includes('距上一帧 60s'), d.message);
   assert.ok(d.message.includes('疑似学校网关 60 秒超时'), d.message);
-  assert.ok(d.message.includes('已收内容完整交付到第 12.1 KB'), d.message);
-  assert.ok(d.message.includes('客户端可重试'), d.message);
+  assert.ok(d.message.includes('已发送 12.1 KB'), d.message);
+  assert.ok(d.message.includes('重试'), d.message);
 });
 
 test('截断两形态: 中途截断但无交付字节(聚合路径)不含 KB 句子', () => {
@@ -165,14 +176,14 @@ test('截断两形态: 中途截断但无交付字节(聚合路径)不含 KB 句
   assert.strictEqual(d.note, 'agg-truncated');
   assert.ok(d.message.includes('距上一帧 1s'), d.message);
   assert.ok(!d.message.includes('KB'), d.message);
-  assert.ok(d.message.includes('客户端可重试'), d.message);
+  assert.ok(d.message.includes('重试'), d.message);
 });
 
 test('截断两形态: 中途截断但静默未达网关墙 → 连接中断,不带网关归因', () => {
   const d = describeFailedStream(
     { type: 'protocol-error', reason: 'truncated', idleMs: 5_000, sawBytes: true }, 'stream', CFG, 4_096);
   assert.ok(d.message.includes('距上一帧 5s 后连接中断'), d.message);
-  assert.ok(d.message.includes('客户端可重试'), d.message);
+  assert.ok(d.message.includes('重试'), d.message);
   assert.ok(!d.message.includes('网关'), '短静默的中途截断不是网关读空闲墙,不得归因网关');
 });
 

@@ -22,12 +22,19 @@ function stagingFile(file, tag) {
 }
 
 // mode 0o600 在创建时就收紧权限(POSIX 下 umask 不影响显式 mode 的属主位),
-// 避免"先 0644 后 chmod"之间出现世界可读的窗口
+// 避免"先 0644 后 chmod"之间出现世界可读的窗口。
+// 失败时清掉暂存文件:Windows 上 rename 覆盖被占用目标会 EPERM,而调用方
+// 可能反复重试(如 dumpFailed 随失败的请求),不清会在状态目录里堆积孤儿 .tmp
 function atomicWrite(file, content, mode = 0o600) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = stagingFile(file, 'w');
-  fs.writeFileSync(tmp, content, { encoding: 'utf8', mode });
-  fs.renameSync(tmp, file);
+  try {
+    fs.writeFileSync(tmp, content, { encoding: 'utf8', mode });
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch (e2) { /* 未建成或已被清理 */ }
+    throw e;
+  }
 }
 
 // 目标已存在时 link 原子失败(EEXIST),由调用方仲裁。

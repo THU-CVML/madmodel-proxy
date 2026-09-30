@@ -109,7 +109,7 @@ module.exports = function createFileCredentialStore({ protect, unprotect }) {
       try {
         fs.unlinkSync(file);
         cleared.push(file);
-      } catch (e) { /* 不存在:无需清除 */ }
+      } catch (e) { if (e.code !== 'ENOENT') throw e; }
     }
     return cleared;
   }

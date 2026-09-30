@@ -106,21 +106,31 @@ async function logout() {
     const r = await fetch(`http://127.0.0.1:${config.port}/v1/models`, { signal: AbortSignal.timeout(2000) });
     const j = await r.json().catch(() => null);
     if (r.status === 200 && Array.isArray(j?.data)) {
-      throw new Error('代理仍在运行。请先关闭 start.cmd 窗口(或 Ctrl+C),再执行 logout');
+      const e = new Error('代理仍在运行。请先用 Ctrl+C 停止代理与续期守护,再执行 logout');
+      // 不挂 e.code:cli 的通用兜底会把 code 打成 [XXX] 前缀进用户可见输出
+      e.serviceRunning = true;
+      throw e;
     }
   } catch (e) {
-    if (e.message.includes('logout')) throw e; // 自身的指引错误原样上抛
+    // 按标记判定,不匹配错误文案(文案是给人改的,改一次词就静默失效)
+    if (e.serviceRunning) throw e; // 自身的指引错误原样上抛
     /* 探测失败 = 未运行,继续 */
   }
   // ② watch 在跑?(锁 PID 探活)
   try {
     const lockPid = processLock.pidOf(fs.readFileSync(WATCH_LOCK, 'utf8'));
     if (lockPid > 0 && processLock.isAlive(lockPid)) {
-      throw new Error(`watch 续期守护仍在运行(PID ${lockPid})。请先关闭 start.cmd 窗口,再执行 logout`);
+      const e = new Error(`watch 续期守护仍在运行(PID ${lockPid})。请先用 Ctrl+C 停止续期守护,再执行 logout`);
+      e.serviceRunning = true;
+      throw e;
     }
   } catch (e) {
-    if (e.message.includes('logout')) throw e;
-    /* 无锁文件 = 未运行,继续 */
+    if (e.serviceRunning) throw e; // 自身的指引错误原样上抛
+    // 只有"锁文件不存在"才等于未运行。其余读取失败(权限、目录被占、
+    // IO 错误)不是"没在跑"的证据——静默放行会在这道闸本该校验的场景下
+    // 直接清掉凭据。上抛让用户看到原因再决定(2026-09-22 审阅指出)
+    if (e.code !== 'ENOENT') throw e;
+    /* ENOENT = 无锁文件,未运行,继续 */
   }
   // ③ 持认证锁清除(与 login/once 互斥,防进行中的续期写回)
   return withAuthLock(() => {
@@ -134,8 +144,7 @@ let activeScheduler = null;
 async function watch() {
   const lock = processLock.acquirePidLock(WATCH_LOCK);
   if (!lock.ok) {
-    console.error(`已有 watch 守护在运行(PID ${lock.pid},锁: ${WATCH_LOCK}),不重复启动。`);
-    console.error('锁为死进程残留时,删除该锁文件后重试。');
+    console.error(`续期服务已在运行（PID ${lock.pid}），跳过启动。`);
     process.exit(0);
   }
   process.on('exit', () => processLock.releasePidLock(WATCH_LOCK));
@@ -149,7 +158,7 @@ async function watch() {
     process.exit(130);
   });
 
-  console.log('madmodel token 自动续期守护进程已启动(PID ' + process.pid + ')');
+  console.log('自动续期已启动');
   // TUNNEL_REVIVE 一并纳入监听:代理遇隧道会话被拒(302→/login,如网络切换
   // 后 WebVPN 会话绑定失效)时写该标志,文件事件把 wait 提前唤醒
   const wakeup = createFileWakeup([TOKEN_FILE, CREDS_FILE, TUNNEL_REVIVE]);
@@ -185,7 +194,7 @@ async function watch() {
       }
       return;
     }
-    console.log('[' + stamp() + '] 代理报告隧道会话被拒,立即探活(网络切换场景常见)');
+    console.log('[' + stamp() + '] WebVPN 会话被拒绝，正在检查');
     scheduler.pokeKeepalive();
   };
   // 隧道会话保活:带存储的 cookie 探活 WebVPN 隧道(探测本身重置隧道空闲

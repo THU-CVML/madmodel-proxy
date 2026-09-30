@@ -32,7 +32,7 @@ async function main() {
   // 0) 代理在线
   const models = await fetch(`${BASE}/v1/models`).then(r => r.json()).catch(() => null);
   if (!models || !Array.isArray(models.data)) {
-    console.error(`❌ 代理未运行(${BASE}),先启动 start.cmd`);
+    console.error(`❌ 代理未运行(${BASE}),先运行 npm start`);
     process.exit(1);
   }
 
@@ -60,7 +60,7 @@ async function main() {
   check(r.status === 200 && usageOk, '非流式短请求:聚合与 usage 注入生效', usageDetail);
 
   console.log(failed
-    ? `\n结果: ${failed} 项失败——协议处理与真实上游不兼容,查代理日志中 stream-invalid/截断行`
+    ? `\n结果: ${failed} 项失败，请检查对应响应和代理日志；网络、凭据或上游状态也可能影响结果`
     : '\n结果: 真实流量冒烟通过');
   process.exit(failed ? 1 : 0);
 }
