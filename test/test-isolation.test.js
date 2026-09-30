@@ -16,7 +16,8 @@ test('凭据测试忽略外部路径覆盖，外部哨兵保留原内容', { tim
   const env = createTestEnv(path.join(process.env.MADMODEL_STATE_DIR, 'child'), {
     MADMODEL_CREDS_FILE: sentinel, PROXY_TOKEN_FILE: sentinel, PROXY_UPSTREAM: 'http://127.0.0.1:1', DUMP_FAILED: '1',
   });
-  await promisify(execFile)(process.execPath, ['--test', 'test/credential-store.test.js'], {
+  // 直接运行单文件，避开 Node 18 --test 父进程的中文 TAP 解析问题。
+  await promisify(execFile)(process.execPath, ['test/credential-store.test.js'], {
     cwd: path.resolve(__dirname, '..'), env, timeout: 15000,
   });
   assert.equal(fs.readFileSync(sentinel, 'utf8'), text);
