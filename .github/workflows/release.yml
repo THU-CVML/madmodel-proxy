@@ -21,7 +21,7 @@ permissions:
 
 env:
   RELEASE_TAG: v1.10.3
-  RELEASE_SHA: b15c2f68ff0f99c263e4c13cc22d8f3ddd509ab6
+  RELEASE_SHA: ca195edc6d9488ad58d2396f34423dee25e9a757
   PUBLISH_AT: '2026-10-01T04:00:00Z'
   EXPIRES_AT: '2026-10-01T16:00:00Z'
   DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
