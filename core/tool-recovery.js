@@ -87,12 +87,13 @@ function createToolRecovery({ config, upstreamClient }) {
       fixed = await retry(payload, auth, signal, tools, thinkingField);
     }
     const retryUsage = inline ? undefined : fixed?.usage;
-    if (!fixed?.calls?.length) return { retryUsage, note: '工具恢复未成功，返回原回复' };
+    const retryAttempted = !inline;
+    if (!fixed?.calls?.length) return { retryUsage, retryAttempted, note: '工具恢复未成功，返回原回复' };
     msg.tool_calls = fixed.calls;
     msg.content = fixed.content || null;
     ch.finish_reason = 'tool_calls';
     if (fixed.usage) body.usage = fixed.usage;
-    return { recovered: true, retryUsage,
+    return { recovered: true, retryUsage, retryAttempted,
       note: `工具调用 ${fixed.calls.length}（${inline ? '文本' : '重试'}恢复）` };
   };
 }

@@ -163,26 +163,7 @@ function reasoningFieldsFor(fields) {
 
 function normalizeReasoningDelta(obj, fields) {
   const ch = obj && obj.choices && obj.choices[0];
-  if (!ch || !ch.delta || typeof ch.delta !== 'object') return false;
-  const d = ch.delta;
-  const list = reasoningFieldsFor(fields);
-
-  const parts = [];
-  let foreign = false;
-  for (const f of list) {
-    if (!(f in d)) continue;
-    const v = d[f];
-    if (typeof v === 'string' && v !== '') parts.push(v);
-    if (f !== 'reasoning_content') foreign = true;
-  }
-  if (!foreign) return false;
-
-  for (const f of list) {
-    if (f !== 'reasoning_content') delete d[f];
-  }
-  if (parts.length) d.reasoning_content = parts.join('');
-  else delete d.reasoning_content;
-  return true;
+  return normalizeReasoning(ch?.delta, fields);
 }
 
 // 多个思考方言同时出现时取首个非空值，避免重复累加。
@@ -197,23 +178,21 @@ function readReasoningDelta(delta, fields) {
 
 function normalizeCompletionReasoning(body, fields) {
   const msg = body && body.choices && body.choices[0] && body.choices[0].message;
+  return normalizeReasoning(msg, fields);
+}
+
+// 上游可能同时返回两个内容相同的别名字段。与读取、聚合路径一致，
+// 只取首个非空值；不要对文本本身去重，连续帧中的重复字词可能是正常内容。
+function normalizeReasoning(msg, fields) {
   if (!msg || typeof msg !== 'object') return false;
   const list = reasoningFieldsFor(fields);
-
-  const parts = [];
-  let foreign = false;
-  for (const f of list) {
-    if (!(f in msg)) continue;
-    const v = msg[f];
-    if (typeof v === 'string' && v !== '') parts.push(v);
-    if (f !== 'reasoning_content') foreign = true;
-  }
-  if (!foreign) return false;
+  if (!list.some(f => f !== 'reasoning_content' && f in msg)) return false;
+  const value = readReasoningDelta(msg, fields);
 
   for (const f of list) {
     if (f !== 'reasoning_content') delete msg[f];
   }
-  if (parts.length) msg.reasoning_content = parts.join('');
+  if (value !== null) msg.reasoning_content = value;
   else delete msg.reasoning_content;
   return true;
 }

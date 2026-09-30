@@ -31,6 +31,9 @@ function translateUpstreamError(bodyObj, raw, status, busyHint) {
   }
   const overflowMessage = hint =>
     `疑似上下文超限，本地估算输入 ${hint.promptTokens} + 输出预算 ${hint.tokenBudget}，上限 ${hint.contextWindow} tokens。请缩短对话或降低输出预算。`;
+  const nearLimit = busyHint && busyHint.tokenBudget > 0 && busyHint.reserveTokens > 0 &&
+    busyHint.promptTokens + busyHint.tokenBudget + busyHint.reserveTokens >= busyHint.contextWindow;
+  const budgetAdvice = '输入与输出预算接近上下文上限，请先降低 max_tokens 或缩短对话。';
 
   if (bodyObj?.status === 10001) {
     if (likelyOverflow(busyHint)) {
@@ -39,14 +42,15 @@ function translateUpstreamError(bodyObj, raw, status, busyHint) {
     return {
       http: 429,
       message: `上游拒绝请求（10001，${detail ? String(detail).slice(0, 120) : '未提供详情'}）。` +
-        '请检查模型名和请求参数，或缩短对话后重试。',
+        (nearLimit ? budgetAdvice : '请检查模型名和请求参数，或缩短对话后重试。'),
     };
   }
   if (typeof bodyObj?.errorMessage === 'string' && /繁忙/.test(bodyObj.errorMessage)) {
     if (likelyOverflow(busyHint)) {
       return { http: 413, message: overflowMessage(busyHint) };
     }
-    return { http: 429, message: `上游提示“${bodyObj.errorMessage.slice(0, 120)}”，也可能是参数不兼容。请用短对话和默认参数重试。` };
+    return { http: 429, message: `上游提示“${bodyObj.errorMessage.slice(0, 120)}”。` +
+      (nearLimit ? budgetAdvice : '也可能是参数不兼容，请用短对话和默认参数重试。') };
   }
   if (detail) return { http: 502, message: `上游拒绝请求: ${String(detail).slice(0, 120)}` };
   if (raw && /<html/i.test(String(raw))) {

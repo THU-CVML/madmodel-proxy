@@ -2,7 +2,7 @@
 
 'use strict';
 
-const { normalizePayload, parseJsonBody, fitTokenBudget } = require('./payload');
+const { normalizePayload, parseJsonBody, fitTokenBudget, promptTokenReserve } = require('./payload');
 const { translateUpstreamError, describeFailedStream } = require('./errors');
 const { createAggregator } = require('./completion-aggregator');
 const { getTokenizer } = require('./tokenizer');
@@ -18,8 +18,38 @@ function busyHint(payload, contextWindow) {
   return {
     promptTokens: getTokenizer().countPromptTokens(payload),
     tokenBudget: typeof payload.max_tokens === 'number' ? payload.max_tokens : 0,
+    reserveTokens: promptTokenReserve(payload),
     contextWindow,
   };
+}
+
+function recordFirstOutput(ctx, obj, thinkingField) {
+  if (ctx.firstOutputAt !== undefined) return;
+  const delta = obj?.choices?.[0]?.delta;
+  if ((typeof delta?.content === 'string' && delta.content.length > 0) ||
+      readReasoningDelta(delta, thinkingField) !== null ||
+      (Array.isArray(delta?.tool_calls) && delta.tool_calls.some(tc =>
+        (typeof tc?.function?.name === 'string' && tc.function.name.length > 0) ||
+        (typeof tc?.function?.arguments === 'string' && tc.function.arguments.length > 0)))) {
+    ctx.firstOutputAt = Date.now();
+  }
+}
+
+// 均速反映整次请求的等待、生成和交付，不冒充服务端纯解码速度。
+function performanceNote(ctx, usage, recovery = {}, now = Date.now()) {
+  const parts = [];
+  const firstMs = ctx.firstOutputAt - ctx.started;
+  if (Number.isFinite(firstMs) && firstMs >= 0) parts.push(`首字 ${(firstMs / 1000).toFixed(1)}s`);
+  const usages = recovery.retryAttempted ? [usage, recovery.retryUsage] : [usage];
+  const elapsedMs = now - ctx.started;
+  if (elapsedMs > 0 && Number.isFinite(elapsedMs) && usages.every(u =>
+    Number.isFinite(u?.completion_tokens) && u.completion_tokens >= 0)) {
+    // completion_tokens 已含思考，不再加 reasoning_tokens。
+    const tokens = usages.reduce((n, u) => n + u.completion_tokens, 0);
+    const rate = tokens * 1000 / elapsedMs;
+    if (tokens > 0 && Number.isFinite(rate)) parts.push(`均速 ${rate.toFixed(1)} tok/s`);
+  }
+  return parts.length ? ` | ${parts.join(' · ')}` : '';
 }
 
 function createProxyService(deps) {
@@ -74,6 +104,10 @@ function createProxyService(deps) {
     const fmt = n => n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : (n >= 10000 ? `${(n / 1000).toFixed(1)}K` : String(n));
     return ` | token ${p}/${c}` + (r ? `(思考 ${r})` : '') +
       ` 累计 ${fmt(tokTotal.p)}/${fmt(tokTotal.c)}`;
+  }
+
+  function requestUsageNote(ctx, usage, recovery) {
+    return usageNote(usage, recovery.retryUsage) + performanceNote(ctx, usage, recovery);
   }
 
   function authenticateRequest() {
@@ -272,6 +306,7 @@ function createProxyService(deps) {
     const result = await upstreamClient.request({
       payload, token: auth.token, cookie: auth.cookie, signal: ac.signal,
       onChunk: async (obj) => {
+        recordFirstOutput(ctx, obj, streamThinkingField);
         if (bufferFrames && !bufferFramesOff) {
           const ch = obj?.choices?.[0];
           const d = ch?.delta || {};
@@ -365,7 +400,7 @@ function createProxyService(deps) {
         const msg = body.choices[0].message;
         await writeRecovered(ctx, servedModel, msg.tool_calls, msg.content, body.usage);
         logReq(req, 200, started, size,
-          `${recovery.note}${budgetNote}${usageNote(originalUsage, recovery.retryUsage)}`, servedModel);
+          `${recovery.note}${budgetNote}${requestUsageNote(ctx, originalUsage, recovery)}`, servedModel);
         return;
       }
     }
@@ -404,13 +439,13 @@ function createProxyService(deps) {
       }
       await ctx.writeSseLine('data: [DONE]\n\n');
       ctx.endResponse();
-      logReq(req, 200, started, size, `${recovery.note || '流式'}${budgetNote}${usageNote(originalUsage, recovery.retryUsage)}`, servedModel);
+      logReq(req, 200, started, size, `${recovery.note || '流式'}${budgetNote}${requestUsageNote(ctx, originalUsage, recovery)}`, servedModel);
       return;
     }
     if (ctx.sseHeadersSent()) {
       await ctx.writeSseLine('data: [DONE]\n\n');
       ctx.endResponse();
-      logReq(req, 200, started, size, `${recovery.note || '流式'}${budgetNote}${usageNote(originalUsage, recovery.retryUsage)}`, servedModel);
+      logReq(req, 200, started, size, `${recovery.note || '流式'}${budgetNote}${requestUsageNote(ctx, originalUsage, recovery)}`, servedModel);
     } else {
       logReq(req, 502, started, size, '上游返回空流', servedModel);
       ctx.sendError(502, '上游返回空流');
@@ -435,7 +470,7 @@ function createProxyService(deps) {
     try {
       result = await upstreamClient.request({
         payload, token: auth.token, cookie: auth.cookie, signal: ac.signal,
-        onChunk: obj => { chunkCount++; agg.feed(obj); },
+        onChunk: obj => { recordFirstOutput(ctx, obj, aggThinkingField); chunkCount++; agg.feed(obj); },
       });
     } finally { clearTimeout(timer); }
 
@@ -477,11 +512,11 @@ function createProxyService(deps) {
     const recovery = await recoverTools(out, payload, auth, ac.signal, aggThinkingField);
     if (ctx.clientGone()) return;
     logReq(req, 200, started, size,
-      `${recovery.note || '完成'}${budgetNote}${usageNote(originalUsage, recovery.retryUsage)}`, payload.model);
+      `${recovery.note || '完成'}${budgetNote}${requestUsageNote(ctx, originalUsage, recovery)}`, payload.model);
     ctx.sendJson(200, out, extraHeaders);
   }
 
   return { handleRequest, logReq, usageNote };
 }
 
-module.exports = { createProxyService };
+module.exports = { createProxyService, performanceNote };

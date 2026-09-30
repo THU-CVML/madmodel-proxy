@@ -19,6 +19,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { readReasoningDelta } = require('./thinking');
 
 // ---- byte-level 字母表(GPT-2 同构):可打印 ASCII + ¡-¬ + ®-ÿ 原样,其余字节映射到 256+ ----
 function buildByteToUni() {
@@ -219,6 +220,9 @@ function createTokenizer(model, opts = {}) {
     let total = typeof c === 'string' ? countText(c)
       : Array.isArray(c) ? c.reduce((s, p) => s + (typeof p?.text === 'string' ? countText(p.text) : 0), 0)
         : 0;
+    // 工具循环会把历史思考一并回传；即使上游有时丢弃旧轮次，也按保守口径计入。
+    // 同义字段只计一次，正文中的普通 text 则保持独立。
+    if (m?.role === 'assistant') total += countText(readReasoningDelta(m) || '');
     if (Array.isArray(m?.tool_calls)) {
       for (const tc of m.tool_calls) {
         total += countText(tc?.function?.name || '');

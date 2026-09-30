@@ -91,6 +91,19 @@ test('复判: 恰等于上限不算超限(上游 > 才拒)', () => {
   assert.strictEqual(m.http, 429);
 });
 
+test('复判: 接近估算边界给出预算建议，真实 HTTP 限流仍优先', () => {
+  const hint = { promptTokens: 47860, tokenBudget: 999692, contextWindow: 1048576, reserveTokens: 1024 };
+  for (const body of [BUSY, { status: 10001, message: '服务器繁忙' }]) {
+    const mapped = translateUpstreamError(body, '', 200, hint);
+    assert.strictEqual(mapped.http, 429, '估算不能证明实际超限');
+    assert.ok(mapped.message.includes('降低 max_tokens'));
+    assert.ok(!mapped.message.includes('疑似上下文超限'));
+  }
+  const limited = translateUpstreamError(BUSY, '', 429, hint);
+  assert.ok(limited.message.includes('HTTP 429'));
+  assert.ok(!limited.message.includes('降低 max_tokens'));
+});
+
 // ---- 10001 复判:结构化状态码与"繁忙"文案同族(2026-09-16 补齐,此前该分支
 // 不查 busyHint,超限被报 429 诱导客户端无限重试)。复判逻辑与"繁忙"分支
 // 经共享 helper(likelyOverflow)实现,边界语义一致,此处钉 10001 分支的接线 ----

@@ -30,11 +30,40 @@ test('归一: 已是 reasoning_content 的帧不动(高频路径不做无谓改�
   assert.strictEqual(f.choices[0].delta.reasoning_content, 'DeepSeek 的思考');
 });
 
-test('归一: 两键同时出现则按序拼接,不丢字', () => {
+test('归一: 两键不同也按读取优先级选取，与聚合路径一致', () => {
   const f = frame({ reasoning_content: 'AA', reasoning: 'BB' });
   assert.strictEqual(normalizeReasoningDelta(f), true);
-  assert.strictEqual(f.choices[0].delta.reasoning_content, 'AABB');
+  assert.strictEqual(f.choices[0].delta.reasoning_content, 'AA');
   assert.ok(!('reasoning' in f.choices[0].delta));
+});
+
+test('归一: 流式、JSON 和聚合都只交付一份别名内容，保留跨帧重复', () => {
+  for (const alias of ['reasoning', 'reasoning_v2']) {
+    const agg = createAggregator('m', alias);
+    let streamed = '';
+    for (const text of ['用户', '用户', '问的是']) {
+      const f = frame({ content: '', reasoning_content: text, [alias]: text });
+      agg.feed(JSON.parse(JSON.stringify(f)));
+      normalizeReasoningDelta(f, alias);
+      streamed += f.choices[0].delta.reasoning_content;
+      assert.ok(!(alias in f.choices[0].delta));
+    }
+    const b = completion({ content: '正文', reasoning_content: '用户用户问的是', [alias]: '用户用户问的是' });
+    normalizeCompletionReasoning(b, alias);
+    assert.strictEqual(streamed, '用户用户问的是');
+    assert.strictEqual(b.choices[0].message.reasoning_content, streamed);
+    assert.strictEqual(agg.result().choices[0].message.reasoning_content, streamed);
+    assert.strictEqual(b.choices[0].message.content, '正文');
+  }
+});
+
+test('归一: 标准字段为空时，流式与 JSON 都回落到非空别名', () => {
+  const f = frame({ reasoning_content: '', reasoning: '思考' });
+  const b = completion({ reasoning_content: null, reasoning: '思考' });
+  normalizeReasoningDelta(f);
+  normalizeCompletionReasoning(b);
+  assert.strictEqual(f.choices[0].delta.reasoning_content, '思考');
+  assert.strictEqual(b.choices[0].message.reasoning_content, '思考');
 });
 
 test('归一: reasoning=null(思考段结束)收掉方言键,且不造空 reasoning_content', () => {

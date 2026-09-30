@@ -121,35 +121,21 @@ function normalizePayload(payload, model, meta, maxOutputTokens) {
   return applied;
 }
 
-// 上游按 prompt_tokens+max_tokens ≤ 262,144 逐 token 校验(2026-09-10 实测,
-// 边界随 prompt 精确平移)。预检超限时不拒绝:把 max_tokens 收到剩余空间
-// 再发——max_tokens 是输出上限而非目标,收缩对绝大多数请求无感,代价仅
-// 高位长输出需续写(finish_reason:length)。剩余空间放不下最低输出预算才
-// 判 413:prompt 本身超限。预算下限思考感知(1.8.1):思考开启/缺省时 512
-// (思考会消耗输出预算,极小预算让 content 恒空——ZCode 探测请求实测);
-// 关闭思考后预算全给内容,1 即有效,0 意味着一个输出 token 都放不下,拒绝。
-// max_tokens 缺省时仅在 prompt 本身超限才拒绝(上游缺省输出预算未知,
-// 不注入不收缩,交上游仲裁)。归一化先于本函数执行,思考关闭此时恒表达为
-// chat_template_kwargs.thinking === false
-//
-// ⚠️ tools 的模板开销(2026-09-29 实测补充):上面那个"本地分词器与上游逐
-// token 一致"的前提**对 tools 部分不成立**——上游把工具定义按自己的 chat
-// 模板序列化,比本地按纯文本计的多算约 16~18 token/个。实测反推(二分法找
-// 各档"仍被接受的最大 max_tokens",再用窗口减去本地 prompt):
-//     tools= 3 → 多算  48 token(16.0/个)
-//     tools=10 → 多算 167 token(16.7/个)
-//     tools=33 → 多算 604 token(18.3/个)
-// 不补这笔账的后果:带工具的长会话(agent 客户端恒带几十个工具)本地算出
-// "还剩得下"、上游却判超限 ⇒ **请求被上游以 `{"errorMessage":"服务器繁忙"}`
-// 秒拒**,而用户看到的是"上游忙"。这正是 Windows 下 ZCode 带 33 个工具时
-// qwen 反复 429 的机制。留 20/个(>实测斜率上界 18.3)作为余量
+// 输入、模板余量与输出预算共享模型窗口。只收缩显式输出预算；
+// 未指定 max_tokens 时不注入默认值，输入与余量已超限才拒绝。
+// 工具定义按上游模板渲染的实测额外开销约为每项 16~18 token，预留 20。
 const TOOL_DEF_TOKENS = 20;
+// 模板与本地计数仍可能有偏差，不把输出预算压到估算窗口的最后一个 token。
+const CONTEXT_RESERVE_TOKENS = 1024;
+
+function promptTokenReserve(payload) {
+  const toolCount = Array.isArray(payload?.tools) ? payload.tools.length : 0;
+  return CONTEXT_RESERVE_TOKENS + toolCount * TOOL_DEF_TOKENS;
+}
 
 function fitTokenBudget(promptTokens, payload, contextWindow) {
-  // 工具定义的上游模板开销(见上方 TOOL_DEF_TOKENS 说明)。只加不减:
-  // 多算只是让 max_tokens 少给一点(安全侧),少算会让请求被整个拒掉
-  const toolCount = Array.isArray(payload && payload.tools) ? payload.tools.length : 0;
-  const effectivePrompt = promptTokens + toolCount * TOOL_DEF_TOKENS;
+  const reserve = promptTokenReserve(payload);
+  const effectivePrompt = promptTokens + reserve;
 
   const budget = typeof payload.max_tokens === 'number' ? payload.max_tokens : 0;
   if (effectivePrompt + budget <= contextWindow) return { ok: true, note: '' };
@@ -162,11 +148,11 @@ function fitTokenBudget(promptTokens, payload, contextWindow) {
   if (room < floor) {
     return {
       ok: false,
-      message: `上下文空间不足，本地估算输入 ${effectivePrompt}、最低输出 ${floor}，上下文上限 ${contextWindow} tokens。请缩短对话。`,
+      message: `上下文空间不足，本地估算输入 ${promptTokens}、预留余量 ${reserve}、最低输出 ${floor}，上下文上限 ${contextWindow} tokens。请缩短对话。`,
     };
   }
   payload.max_tokens = room;
   return { ok: true, note: ` norm[max_tokens→${room} 预检收缩]` };
 }
 
-module.exports = { parseJsonBody, normalizePayload, fitTokenBudget, TOOL_DEF_TOKENS };
+module.exports = { parseJsonBody, normalizePayload, fitTokenBudget, promptTokenReserve, TOOL_DEF_TOKENS, CONTEXT_RESERVE_TOKENS };

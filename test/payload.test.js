@@ -5,7 +5,7 @@ require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');
-const { parseJsonBody, normalizePayload, fitTokenBudget } = require('../core/payload');
+const { parseJsonBody, normalizePayload, fitTokenBudget, CONTEXT_RESERVE_TOKENS } = require('../core/payload');
 
 const MODEL = 'DeepSeek-V4-Flash-0731';
 
@@ -291,16 +291,16 @@ test('预算适配: 超限收缩到剩余空间', () => {
   const p = { max_tokens: 65536 };
   const r = fitTokenBudget(230000, p, 262144);
   assert.strictEqual(r.ok, true);
-  assert.strictEqual(p.max_tokens, 32144);
-  assert.ok(r.note.includes('32144'));
+  assert.strictEqual(p.max_tokens, 32144 - CONTEXT_RESERVE_TOKENS);
+  assert.ok(r.note.includes(String(p.max_tokens)));
 });
 
-test('预算适配: 恰等于上限不动', () => {
+test('预算适配: 恰等于估算上限仍保留模板余量', () => {
   const p = { max_tokens: 65536 };
   const r = fitTokenBudget(196608, p, 262144);
   assert.strictEqual(r.ok, true);
-  assert.strictEqual(p.max_tokens, 65536);
-  assert.strictEqual(r.note, '');
+  assert.strictEqual(p.max_tokens, 65536 - CONTEXT_RESERVE_TOKENS);
+  assert.ok(r.note.includes(String(p.max_tokens)));
 });
 
 test('预算适配: 剩余空间 <512 判 413(prompt 本身超限)', () => {
@@ -342,39 +342,39 @@ test('思考感知: 方言冲突时任一关闭信号即关闭(effort=high + 原
 
 test('思考感知: 关闭思考 + 剩余 100 + 预算 1000 → 收缩到 100 放行', () => {
   const p = { max_tokens: 1000, chat_template_kwargs: { thinking: false } };
-  const r = fitTokenBudget(262044, p, 262144);
+  const r = fitTokenBudget(262044 - CONTEXT_RESERVE_TOKENS, p, 262144);
   assert.strictEqual(r.ok, true);
   assert.strictEqual(p.max_tokens, 100);
 });
 
 test('思考感知边界: 剩余 0/1/511/512 × 思考开/关', () => {
-  // room=262144-prompt
+  // room=262144-prompt-CONTEXT_RESERVE_TOKENS
   const mk = (room, off) => ({
     max_tokens: 1000,
     ...(off ? { chat_template_kwargs: { thinking: false } } : {}),
   });
   // 剩余 0:两种形态都拒绝
-  assert.strictEqual(fitTokenBudget(262144, mk(0, true), 262144).ok, false);
-  assert.strictEqual(fitTokenBudget(262144, mk(0, false), 262144).ok, false);
+  assert.strictEqual(fitTokenBudget(262144 - CONTEXT_RESERVE_TOKENS, mk(0, true), 262144).ok, false);
+  assert.strictEqual(fitTokenBudget(262144 - CONTEXT_RESERVE_TOKENS, mk(0, false), 262144).ok, false);
   // 剩余 1:思考关闭收缩到 1;思考开启拒绝(<512)
   const pOff1 = mk(1, true);
-  const rOff1 = fitTokenBudget(262143, pOff1, 262144);
+  const rOff1 = fitTokenBudget(262143 - CONTEXT_RESERVE_TOKENS, pOff1, 262144);
   assert.strictEqual(rOff1.ok, true);
   assert.strictEqual(pOff1.max_tokens, 1);
-  assert.strictEqual(fitTokenBudget(262143, mk(1, false), 262144).ok, false);
+  assert.strictEqual(fitTokenBudget(262143 - CONTEXT_RESERVE_TOKENS, mk(1, false), 262144).ok, false);
   // 剩余 511:思考关闭收缩到 511;思考开启拒绝
   const pOff511 = mk(511, true);
-  const rOff511 = fitTokenBudget(261633, pOff511, 262144);
+  const rOff511 = fitTokenBudget(261633 - CONTEXT_RESERVE_TOKENS, pOff511, 262144);
   assert.strictEqual(rOff511.ok, true);
   assert.strictEqual(pOff511.max_tokens, 511);
-  assert.strictEqual(fitTokenBudget(261633, mk(511, false), 262144).ok, false);
+  assert.strictEqual(fitTokenBudget(261633 - CONTEXT_RESERVE_TOKENS, mk(511, false), 262144).ok, false);
   // 剩余 512:两种形态都收缩到 512
   const pOn512 = mk(512, false);
-  const rOn512 = fitTokenBudget(261632, pOn512, 262144);
+  const rOn512 = fitTokenBudget(261632 - CONTEXT_RESERVE_TOKENS, pOn512, 262144);
   assert.strictEqual(rOn512.ok, true);
   assert.strictEqual(pOn512.max_tokens, 512);
   const pOff512 = mk(512, true);
-  assert.strictEqual(fitTokenBudget(261632, pOff512, 262144).ok, true);
+  assert.strictEqual(fitTokenBudget(261632 - CONTEXT_RESERVE_TOKENS, pOff512, 262144).ok, true);
   assert.strictEqual(pOff512.max_tokens, 512);
 });
 
@@ -398,21 +398,21 @@ test('预算适配: 带 tools 时按每工具 20 token 计入 prompt(实测斜�
   const p = { max_tokens: 262000, tools: toolsN(10) };
   const r = fitTokenBudget(1000, p, 262144);
   assert.strictEqual(r.ok, true);
-  // room = 262144 - 1000 - 200 = 260944
-  assert.strictEqual(p.max_tokens, 260944, '必须把工具开销算进去,否则上游会拒');
+  // 工具开销与通用余量分别扣除
+  assert.strictEqual(p.max_tokens, 260944 - CONTEXT_RESERVE_TOKENS, '必须把工具开销算进去,否则上游会拒');
 });
 
-test('预算适配: 无 tools 时行为不变(不回归)', () => {
+test('预算适配: 无 tools 时仍保留通用模板余量', () => {
   const p = { max_tokens: 262000 };
   const r = fitTokenBudget(1000, p, 262144);
-  // 1000 + 262000 > 262144 ⇒ 收缩到 261144,不带任何工具开销
-  assert.strictEqual(p.max_tokens, 261144);
+  // 不带工具开销，但仍保留通用余量
+  assert.strictEqual(p.max_tokens, 261144 - CONTEXT_RESERVE_TOKENS);
  });
 
 test('预算适配: tools 为空数组时不加开销', () => {
   const p = { max_tokens: 262000, tools: [] };
   fitTokenBudget(1000, p, 262144);
-  assert.strictEqual(p.max_tokens, 261144);
+  assert.strictEqual(p.max_tokens, 261144 - CONTEXT_RESERVE_TOKENS);
 });
 
 test('预算适配: tools 非数组(畸形输入)不加开销、不抛错', () => {
@@ -420,7 +420,7 @@ test('预算适配: tools 非数组(畸形输入)不加开销、不抛错', () =
     const p = { max_tokens: 262000, tools: bad };
     const r = fitTokenBudget(1000, p, 262144);
     assert.strictEqual(r.ok, true);
-    assert.strictEqual(p.max_tokens, 261144);
+    assert.strictEqual(p.max_tokens, 261144 - CONTEXT_RESERVE_TOKENS);
   }
 });
 
@@ -431,7 +431,7 @@ test('预算适配: 工具开销能把"看似放得下"的请求拖到超限', (
   const p = { max_tokens: 262000, tools: toolsN(33) };
   const r = fitTokenBudget(5, p, 262144);
   assert.strictEqual(r.ok, true);
-  assert.strictEqual(p.max_tokens, 262144 - 5 - 33 * TOOL_DEF_TOKENS);
+  assert.strictEqual(p.max_tokens, 262144 - 5 - 33 * TOOL_DEF_TOKENS - CONTEXT_RESERVE_TOKENS);
   assert.ok(p.max_tokens < 262000, '必须收缩');
 });
 
@@ -447,6 +447,15 @@ test('预算适配: TOOL_DEF_TOKENS 覆盖实测斜率上界', () => {
   // 实测每工具开销:3→16.0 / 10→16.7 / 33→18.3。取 20 留余量;
   // 若有人把它调到 18.3 以下,真实请求会重新撞上游边界
   assert.ok(TOOL_DEF_TOKENS >= 19, '必须 >= 实测斜率上界 18.3,当前 ' + TOOL_DEF_TOKENS);
+});
+
+test('预算适配: DSH 的 57 工具历史请求不再超过真实上游窗口', () => {
+  // 2026-09-30 重建请求：旧计数 46684，补计历史思考 337；
+  // 上游 usage.prompt_tokens 实测 47860，窗口 1048576。
+  const p = { max_tokens: 1048576, tools: toolsN(57) };
+  assert.strictEqual(fitTokenBudget(47021, p, 1048576).ok, true);
+  assert.ok(47860 + p.max_tokens < 1048576, '真实输入与输出预算必须留在窗口内');
+  assert.ok(p.max_tokens > 990000, '应只收缩必要余量，不把模型输出能力降成固定小值');
 });
 
 // ---- 逐模型输出上限的安全值(2026-09-29 实测边界) ----
