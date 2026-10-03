@@ -2,6 +2,7 @@
 // 启动层网络场景选择:判定优先级矩阵 + 状态文件读写容错。
 // 判定是纯函数(decide),这里只喂输入断言输出——不需要真的启动代理。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');
@@ -184,7 +185,7 @@ test('询问文案:两个选项都在,且不得声称"回车即默认"', () => {
   const all = nc.PROMPT_LINES.join('\n');
   assert.match(all, /校园网/, '缺校园网选项');
   assert.match(all, /校外/, '缺校外选项');
-  assert.match(all, /不再询问/, '缺"不再询问"的说明');
+  assert.match(all, /会保存/, '缺保存选择的说明');
   // choice 只认 /c 里列出的键,回车不是合法键——所以"无输入=默认"只能靠
   // /t 超时实现,文案里说"回车即选中默认"是假的
   assert.doesNotMatch(all, /回车/, '提示不得声称回车即默认(choice 不接受回车)');

@@ -2,6 +2,7 @@
 // 空帧容忍、[DONE] 终止态、坏帧、单行上限。
 // 2026-09-05 事故的教训归 this 文件守护:空心跳帧必须容忍,未知帧型交给真实流量
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

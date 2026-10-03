@@ -13,9 +13,10 @@ const path = require('path');
 const crypto = require('crypto');
 const { jwtExpiresAt } = require('../madmodel-auth');
 const credentials = require('../platform/credentials');
-const paths = require('../platform/paths');
+const { atomicWrite } = require('../platform/file-store');
+const { normalizeReasoningDelta } = require('../core/thinking');
+const { getModelMeta } = require('../core/model-registry');
 
-// ===== 响应格式(OpenAI 兼容) =====
 function sendJson(res, status, value, extraHeaders) {
   const body = JSON.stringify(value);
   res.writeHead(status, {
@@ -59,34 +60,33 @@ function apiKeyAccepted(presented, keys) {
 // token.json 为 DPAPI 加密格式(v1)或旧明文格式。解密要 spawn PowerShell(约百毫秒),
 // 不能每请求做:以"密文记录 mtime"为缓存键——续期进程原子替换文件后 mtime 必变,
 // 变了才重新解密。测试注入(tokenFileInjected)的文件直接走明文 JSON。
-function createTokenCache(config) {
-  let cache = { mtime: 0, data: null };
+function createTokenCache(config, { now = Date.now, readToken = credentials.readToken, negativeTtlMs = 2000 } = {}) {
+  let cache = { mtime: 0, data: null, checkedAt: -Infinity };
   return function getToken() {
     try {
       const stat = fs.statSync(config.tokenFile);
-      // 仅以 mtime 为缓存键(含 null 负结果):token.json 存在但密文永久
-      // 解不开(换账户/损坏)时,每个请求重走 stat+read+DPAPI(同步阻塞
-      // 100-300ms)只为再得到一次 null——负结果同样按 mtime 缓存,用户
-      // 重新 login 原子替换文件、mtime 变化自然失效
-      if (stat.mtimeMs === cache.mtime) {
+      // 成功读取按 mtime 缓存；失败短暂缓存，钥匙串解锁后无需改写文件。
+      if (stat.mtimeMs === cache.mtime && (cache.data || now() - cache.checkedAt < negativeTtlMs)) {
         return cache.data;
       }
       let data;
       if (config.tokenFileInjected) {
         // 测试注入:明文 JSON(测试 token 无需 DPAPI,且假 token 走 DPAPI 会失败)
         data = JSON.parse(fs.readFileSync(config.tokenFile, 'utf8'));
-        if (!data.token) data = null;
+        // 非对象(如文件内容就是 'null')时 data.token 会抛,被外层 catch 当成
+        // "瞬态失败"回退上次 token——归因不准。显式判一下,语义是"这份记录不可用"
+        if (!data || typeof data !== 'object' || !data.token) data = null;
       } else {
-        data = credentials.readToken(); // 平台解密(DPAPI/钥匙串/机器绑定),坏记录返回 null
+        data = readToken();
       }
       const hadPrevious = !!cache.data;
-      cache = { mtime: stat.mtimeMs, data };
+      cache = { mtime: stat.mtimeMs, data, checkedAt: now() };
       // 热加载可见化:替换既有 token 时打一行日志,确认 watch 续期已被代理接住
       // (首次读取不打——启动横幅已覆盖)
       if (hadPrevious && data?.token) {
         const remainMin = Math.round((data.expiresAt - Date.now()) / 60e3);
-        console.log(`[${new Date().toTimeString().slice(0, 8)}] token 已热加载` +
-          (remainMin > 0 ? `,剩余 ${remainMin} 分钟(watch 续期完成)` : '(⚠ 新 token 仍为过期状态)'));
+        console.log(`[${new Date().toTimeString().slice(0, 8)}] token 已更新` +
+          (remainMin > 0 ? `，剩余 ${remainMin} 分钟` : '，但已过期，请检查续期状态'));
       }
       return data;
     } catch (e) {
@@ -99,6 +99,10 @@ function createTokenCache(config) {
 // ===== 请求体读取 =====
 // Content-Length 预检 + chunked 读取 + 大小限制 + 完成时限。错误带 code/note,
 // 由本层直接映射为 HTTP 响应(读取失败时业务层尚未介入)。
+function bodyLimitMessage(size, limit) {
+  return `请求体 ${(size / 1024).toFixed(0)} KB 超过本地上限 ${(limit / 1024).toFixed(0)} KB，请缩小图片或缩短对话。`;
+}
+
 function readBody(req, limit, timeout) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -108,7 +112,7 @@ function readBody(req, limit, timeout) {
       if (aborted) return;
       aborted = true;
       cleanup();
-      const e = new Error(`请求体接收超时(${timeout / 1000}s)。慢速或中断的上传已被放弃。`);
+      const e = new Error(`请求上传超时（${timeout / 1000}s），请重试。`);
       e.code = 'BODY_TIMEOUT';
       e.size = size;
       e.note = 'body-timeout';
@@ -121,7 +125,7 @@ function readBody(req, limit, timeout) {
       if (size > limit) {
         aborted = true;
         cleanup();
-        const e = new Error(`请求体 ${(size / 1024).toFixed(0)}KB 超过上限(上游 nginx 硬限 1MB,代理预留 950KB)。请压缩上下文后重试。`);
+        const e = new Error(bodyLimitMessage(size, limit));
         e.code = 'BODY_TOO_LARGE';
         e.size = size;
         e.note = 'body-overflow';
@@ -161,7 +165,7 @@ async function readChatBody(req, config) {
   // Content-Length 预检:超限在收任何 body 字节前就拒绝,不陪慢速攻击者耗资源
   const declaredLen = Number(req.headers['content-length']);
   if (Number.isFinite(declaredLen) && declaredLen > config.bodyLimit) {
-    const e = new Error(`请求体 ${(declaredLen / 1024).toFixed(0)}KB 超过上限(上游 nginx 硬限 1MB,代理预留 950KB)。请压缩上下文后重试。`);
+    const e = new Error(bodyLimitMessage(declaredLen, config.bodyLimit));
     e.code = 'BODY_TOO_LARGE';
     e.size = declaredLen;
     e.note = 'cl-precheck';
@@ -184,9 +188,9 @@ function createTokenState(getToken) {
   return function tokenState() {
     const data = getToken();
     if (!data || !data.token) return { code: 'no-token' };
-    const exp = data.expiresAt || jwtExpiresAt(data.token);
+    const exp = data.expiresAt ?? jwtExpiresAt(data.token);
     const msLeft = exp - Date.now();
-    if (msLeft < 0) return { code: 'token-expired' };
+    if (!Number.isFinite(exp) || msLeft <= 0) return { code: 'token-expired' };
     // cookie:WebVPN 隧道会话凭证,随 token 一同续期;旧记录无此字段时为
     // undefined,上游侧按"不带 Cookie 头"处理(直连上游的老配置仍可工作)
     return { ok: true, token: data.token, msLeft, cookie: data.cookie };
@@ -215,7 +219,7 @@ function createCredentialWaiter(getToken) {
   };
 }
 
-function createHttpServer({ config, service, getToken }) {
+function createHttpServer({ config, service, getToken, modelRegistry }) {
   const allowedHosts = new Set([
     `127.0.0.1:${config.port}`, `localhost:${config.port}`, `[::1]:${config.port}`,
     '127.0.0.1', 'localhost', '[::1]',
@@ -257,7 +261,7 @@ function createHttpServer({ config, service, getToken }) {
     const host = String(req.headers.host || '').toLowerCase();
     if (loopbackOnly && !allowedHosts.has(host)) {
       service.logReq(req, 403, started, 0, 'host-rejected');
-      return openAiError(res, 403, 'Host 头不在白名单,已拒绝(本代理仅限本机使用)');
+      return openAiError(res, 403, 'Host 未获允许，请使用本机地址访问。');
     }
     // 浏览器 CSRF 缓解:恶意网页可用 no-cors POST 向本机端口盲发请求(Host
     // 是浏览器正确设置的,白名单防不住写入通道;浏览器对跨源 POST 必带
@@ -273,7 +277,7 @@ function createHttpServer({ config, service, getToken }) {
       } catch (e) { /* 非法 Origin(含 null)按非本机拒绝 */ }
       if (!localOrigin) {
         service.logReq(req, 403, started, 0, 'origin-rejected');
-        return openAiError(res, 403, '跨源请求已拒绝(本代理仅限本机与本地页面使用)');
+        return openAiError(res, 403, '已拒绝外部网页请求，仅支持本地页面。');
       }
     }
 
@@ -281,30 +285,73 @@ function createHttpServer({ config, service, getToken }) {
     // dsh/pi-ai 读 context_window/context_length/max_output_tokens/max_tokens,
     // LM Studio 读 max_context_length,vLLM 惯例是 max_model_len——各客户端
     // 约定不同,一并挂上,让接入的 agent 工具自动拿到真实上下文而非猜默认
+    //
+    // 1.10 起清单来自启动探测(modelRegistry):上游有什么就列什么,不再只列
+    // config 里那一个。1.10.1 起**按客户端选择真实路由**——选中谁就发谁,故本
+    // 清单既是可见性也是可选项来源;各模型的能力差异(思考字段名、窗口大小)
+    // 由请求路径逐模型处理。选到能力不匹配的模型不再被代理拦下,而是如实发往
+    // 上游(见 core/model-registry.js 的说明与 CHANGELOG 1.10.1)
     if (req.method === 'GET' && (url === '/v1/models' || url === '/models')) {
+      const source = modelRegistry ? modelRegistry.available() : config.models.map(id => ({ id }));
       return sendJson(res, 200, {
         object: 'list',
-        data: config.models.map(id => ({
-          id,
-          object: 'model',
-          created: 1720000000,
-          owned_by: 'tsinghua-madmodel',
-          name: id,
-          context_window: config.contextWindow,
-          context_length: config.contextWindow,
-          max_model_len: config.contextWindow,
-          max_context_length: config.contextWindow,
-          max_output_tokens: config.maxModelTokens,
-          max_tokens: config.maxModelTokens,
-        })),
+        data: source.map(entry => {
+          const id = entry.id;
+          const meta = getModelMeta(config, modelRegistry, id);
+          // 探测为不可用的条目(通常是配置的目标模型被下架)如实标注:
+          // 不填能力字段,避免"广告一个用不了的能力"。客户端据 available
+          // 字段可判断它现在发不出请求
+          const usable = entry.ok === true ? true : entry.ok === false ? false : null;
+          // 逐模型上限(1.10.1):三个模型窗口差 4 倍,发布单一值会让客户端把
+          // 1M 的模型当成 128K 用,或对 256K 的模型发出必然被拒的请求
+          const lim = typeof config.limitsFor === 'function' ? config.limitsFor(id) : null;
+          const ctxWin = lim ? lim.contextWindow : config.contextWindow;
+          const maxOut = lim ? lim.maxOutputTokens : config.maxModelTokens;
+          return {
+            id,
+            object: 'model',
+            created: 1720000000,
+            owned_by: 'tsinghua-madmodel',
+            name: id,
+            // 默认推荐标记:客户端可据此预选。1.10.1 起**不再代表"唯一会被路由的
+            // 模型"**——请求按客户端选择路由,选中谁就调谁(见 core/model-registry.js
+            // 的不变式说明);本字段现在只是"配置里的默认值"这一条信息
+            target: id === config.model,
+            // 探测结论:false 表示上游当前不接受它(见启动横幅的模型表)
+            available: usable,
+            context_window: ctxWin,
+            context_length: ctxWin,
+            max_model_len: ctxWin,
+            max_context_length: ctxWin,
+            max_output_tokens: maxOut,
+            max_tokens: maxOut,
+            // 视觉能力取上游声明，未知为 null；不代表实测识别质量。
+            supports_vision: meta?.supportImage ?? null,
+            // 思考能力标注(1.10.1):上游**逐模型用不同字段名**开思考、且各自
+            // 只接受一组固定档位(见 core/thinking.js 的表)。不发布这些,
+            // 客户端只能用通用假设去发(ZCode 发 reasoning_effort:"enabled"),
+            // 而非法档位会被上游 50ms 秒回"服务器繁忙"——这正是"代理里模型
+            // 不吐思考/qwen 必挂、网页端却正常"的成因。客户端读到 reasoning
+            // 就能对上正确档位;thinking_param 说明开关落在哪个字段
+            reasoning: meta ? {
+              supported: !!(meta.thinkingParam || meta.thinkingField || meta.effortOptions?.length),
+              thinking_param: meta.thinkingParam,
+              thinking_field: meta.thinkingField,
+              effort_options: Array.isArray(meta.effortOptions) ? meta.effortOptions : [],
+            } : null,
+          };
+        }),
       });
     }
     // OpenAI 风格根路径
     if (req.method === 'GET' && (url === '/' || url === '/v1' || url === '/v1/')) {
-      return sendJson(res, 200, { status: 'ok', proxy: 'madmodel', models: config.models });
+      return sendJson(res, 200, {
+        status: 'ok', proxy: 'madmodel',
+        models: (modelRegistry ? modelRegistry.available() : config.models.map(id => ({ id }))).map(m => m.id),
+      });
     }
 
-    if (req.method !== 'POST' || !/\/(v1\/)?chat\/completions$/.test(url)) {
+    if (req.method !== 'POST' || !/^\/(v1\/)?chat\/completions$/.test(url)) {
       service.logReq(req, 404, started, 0, 'no-endpoint');
       return openAiError(res, 404, '端点不存在。可用:POST /v1/chat/completions,GET /v1/models');
     }
@@ -317,6 +364,8 @@ function createHttpServer({ config, service, getToken }) {
       service.logReq(req, 500, started, e?.size || 0, `proxy-panic:${String(e?.message || e).slice(0, 60)}`);
       if (!res.headersSent) {
         try { openAiError(res, 500, `代理内部错误: ${e?.message || e}`); } catch (e2) { /* 连接已断 */ }
+      } else {
+        res.end();
       }
     });
   });
@@ -325,13 +374,13 @@ function createHttpServer({ config, service, getToken }) {
   function handleReadError(req, res, e, started) {
     if (e.code === 'CLIENT_ABORT') return; // 客户端已断开,无响应可写
     if (e.code === 'BODY_TIMEOUT') {
-      service.logReq(req, 408, started, e.size || 0, 'body-timeout');
+      service.logReq(req, 408, started, e.size || 0, e.message);
       openAiError(res, 408, e.message);
       req.destroy();
       return;
     }
     if (e.code === 'BODY_TOO_LARGE') {
-      service.logReq(req, 413, started, e.size || 0, e.note || 'body-overflow');
+      service.logReq(req, 413, started, e.size || 0, e.message);
       openAiError(res, 413, e.message);
       if (e.note === 'body-overflow') {
         // 先让 413 冲出内核缓冲再断开:立即 destroy 会连未发出的响应一起丢掉,
@@ -366,6 +415,9 @@ function createHttpServer({ config, service, getToken }) {
     let sseHeadersSent = false;
     let passthroughBytes = 0;
     let extraHeaders = {};
+    // 本模型的思考字段名(由 service 经 ctx.setThinkingFields 注入);null 时
+    // normalizeReasoningDelta 回退到已知方言清单
+    let thinkingFields = null;
     // 背压:客户端读得慢时暂停读上游。入口先查断开状态——客户端已断开时
     // 'close' 早已发过,新挂的 drain/close 监听器永不触发,promise 将永久挂起,
     // 该请求从此没有收尾(日志缺失、连接占住 maxConnections 名额)
@@ -398,6 +450,15 @@ function createHttpServer({ config, service, getToken }) {
       sseBytes: () => passthroughBytes,
       async writeSseChunk(obj) {
         ctx.ensureSseHeaders();
+        // 思考字段归一:上游逐模型用不同字段名吐思考(qwen 是 `reasoning`,
+        // DeepSeek 系是 `reasoning_content`),而客户端只认后者。不归一的话
+        // qwen 的思考会以"客户端不认识的字段"抵达,被静默丢弃——用户看到的是
+        // 全程没有思考,而换 DeepSeek 就正常(2026-09-29 实测定位)。
+        // 放在这个唯一的写出点上做:补发路径、缓冲冲刷、逐帧透传最终都经此,
+        // 漏在任何一条路径上都会"半好半坏"。
+        // thinkingFields 由 service 注入(见 ctx.setThinkingFields);未注入时
+        // 由 thinking.js 的已知方言清单兜底
+        normalizeReasoningDelta(obj, thinkingFields);
         return ctx.writeSseLine(`data: ${JSON.stringify(obj)}\n\n`);
       },
       writeSseLine(line) {
@@ -416,28 +477,35 @@ function createHttpServer({ config, service, getToken }) {
       dumpFailed() {
         if (!config.dumpFailed) return;
         try {
-          // 写状态目录而非仓库目录:诊断文件可能被 git add -f / 打包发布带出仓库
-          fs.mkdirSync(path.dirname(config.tokenFile), { recursive: true });
-          fs.writeFileSync(path.join(path.dirname(config.tokenFile), 'last-failed-request.json'), rawBody);
+          // 写状态目录而非仓库目录:诊断文件可能被 git add -f / 打包发布带出仓库。
+          // 走 atomicWrite:该文件含完整对话,是状态目录里最敏感的一份,权限
+          // (0600)与原子替换都与其余状态文件一致
+          atomicWrite(path.join(path.dirname(config.tokenFile), 'last-failed-request.json'), rawBody);
         } catch (e) { /* 诊断文件写失败不影响主流程 */ }
       },
     };
     // service 完成 token 检查后注入续期提示头(SSE 头尚未发出时生效)
     ctx.setExtraHeaders = headers => { extraHeaders = headers; };
+    // service 把本模型的思考字段名(上游方言)交进来,供 SSE 出口归一化使用。
+    // 出口这层拿不到模型名,不注入就只能用硬编码清单——那样上游换字段名时
+    // 该层会把裸方言键原样发给客户端(其余三条交付路径已用 meta 兜住,这里
+    // 是最后一道,应当同样自足)
+    ctx.setThinkingFields = fields => { thinkingFields = fields; };
 
     return service.handleRequest(ctx);
   }
 
   server.maxConnections = config.maxConnections;
-  // Node 默认 headersTimeout=60s/requestTimeout=300s/keepAliveTimeout=5s,
-  // 对本机个人代理已够;显式设 keepAliveTimeout 略缩,降低连接囤积面
+  // headersTimeout 与 Node 默认的 60s 持平;requestTimeout 从默认 300s 收紧到
+  // 120s(下限由同行的 bodyTimeout 60s 加处理余量决定);keepAliveTimeout 从
+  // 默认 5s 放宽到 10s——本机客户端复用连接的间隔常超过 5s,反复重建不划算
   server.headersTimeout = 60e3;
   server.requestTimeout = 120e3; // 含 body 接收(bodyTimeout 60s + 处理余量)
   server.keepAliveTimeout = 10e3;
 
   server.on('error', e => {
     if (e.code === 'EADDRINUSE') {
-      console.error(`端口 ${config.port} 已被占用:代理可能已在运行。如需另开实例,可用环境变量 PROXY_PORT。`);
+      console.error(`端口 ${config.port} 已占用，请检查已运行的代理，或用 PROXY_PORT 换端口。`);
       process.exit(1);
     }
     // 只打 code/message:完整 error 对象的堆栈含本机绝对路径

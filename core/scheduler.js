@@ -85,7 +85,7 @@ class Scheduler {
       this.nextKeepaliveAt = this.now() + 90e3;
       return true;
     }
-    this.log('WebVPN 隧道会话已失效,提前续期(重签 token + cookie)');
+    this.log('WebVPN 会话已失效，正在续期');
     try {
       await this.refresh();
       this.keepaliveBadCreds = 0;
@@ -96,7 +96,7 @@ class Scheduler {
       // 与主循环同纪律:连续 3 次坏凭据上抛停止——继续重试只是空打登录链
       this.keepaliveBadCreds = e.code === 'BAD_CREDENTIALS' ? this.keepaliveBadCreds + 1 : 0;
       if (this.keepaliveBadCreds >= 3) throw e;
-      this.logError('保活触发的续期失败(' + (e.code || 'unknown') + '): ' + e.message + ',5 分钟后再试');
+      this.logError('续期失败(' + (e.code || 'unknown') + '): ' + e.message + ',5 分钟后重试');
       this.nextKeepaliveAt = this.now() + 5 * 60e3;
     }
     return true;
@@ -125,7 +125,7 @@ class Scheduler {
         continue;
       }
       if (!this.hasCredentials()) {
-        this.log('尚未配置凭据,请先: node refresh-token.js login');
+        this.log('尚未配置凭据，请运行 node refresh-token.js login');
         await wakeup.wait(config.noTokenWaitMs);
         if (this.stopping) break;
         continue;
@@ -137,7 +137,7 @@ class Scheduler {
         continue;
       }
 
-      this.log('token 需要续期,开始认证');
+      this.log('正在续期');
       try {
         await this.refresh();
         retryIdx = 0;

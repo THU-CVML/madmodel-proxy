@@ -1,6 +1,7 @@
 // test/errors.test.js — 错误分类与映射(纯函数):结构化状态码、SSE 内嵌
 // errorMessage、HTML 错误页、无法识别兜底,与 failed-stream 措辞
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');
@@ -30,15 +31,26 @@ test('映射: status 10001 → 429,带/不带详情两种形态', () => {
   const withDetail = translateUpstreamError({ status: 10001, message: '模型不存在' }, '', 200);
   assert.strictEqual(withDetail.http, 429);
   assert.ok(withDetail.message.includes('模型不存在'));
+  // 给出可能原因,让用户能自己缩小范围(上下文/请求体/真繁忙)
+  assert.ok(withDetail.message.includes('请求参数'));
   const noDetail = translateUpstreamError({ status: 10001 }, '', 200);
   assert.strictEqual(noDetail.http, 429);
-  assert.ok(noDetail.message.includes('上游未提供详情'));
+  assert.ok(noDetail.message.includes('未提供详情'), '上游没给详情时要如实说明,不能装作有细节');
 });
 
 test('映射: SSE 内嵌 errorMessage 含"繁忙" → 429 原文', () => {
   const m = translateUpstreamError({ errorMessage: '服务器繁忙，请稍后再试' }, '', 200);
   assert.strictEqual(m.http, 429);
   assert.ok(m.message.includes('服务器繁忙'));
+});
+
+test('映射: 上游网关 413(HTML 错误页) → 413 且给出减体积的处置', () => {
+  const m = translateUpstreamError(null, '<html><title>413 Request Entity Too Large</title></html>', 413);
+  assert.strictEqual(m.http, 413, '体积问题应如实回 413,不是 502');
+  // 网关上限会变(2026-09-28 一天内从 1MiB 提到 5MB 以上),文案不得写死数字
+  assert.ok(!/KB|MB|字节数|1,048|1048576/.test(m.message), '不得在文案里钉死会变的上限:' + m.message);
+  assert.ok(m.message.includes('图'), '应指出图片是最常见的触发原因:' + m.message);
+  assert.ok(!/稍后重试通常自愈/.test(m.message), '体积超限重试无用,不得给这个建议');
 });
 
 // ---- "繁忙"复判:上游对上下文超限也报"繁忙"(2026-09-10 实测),按本地精确
@@ -77,6 +89,19 @@ test('复判: prompt 单独已达上限(无 max_tokens 漏检形态) → 413', (
 test('复判: 恰等于上限不算超限(上游 > 才拒)', () => {
   const m = translateUpstreamError(BUSY, '', 200, { promptTokens: 196608, tokenBudget: 65536, contextWindow: 262144 });
   assert.strictEqual(m.http, 429);
+});
+
+test('复判: 接近估算边界给出预算建议，真实 HTTP 限流仍优先', () => {
+  const hint = { promptTokens: 47860, tokenBudget: 999692, contextWindow: 1048576, reserveTokens: 1024 };
+  for (const body of [BUSY, { status: 10001, message: '服务器繁忙' }]) {
+    const mapped = translateUpstreamError(body, '', 200, hint);
+    assert.strictEqual(mapped.http, 429, '估算不能证明实际超限');
+    assert.ok(mapped.message.includes('降低 max_tokens'));
+    assert.ok(!mapped.message.includes('疑似上下文超限'));
+  }
+  const limited = translateUpstreamError(BUSY, '', 429, hint);
+  assert.ok(limited.message.includes('HTTP 429'));
+  assert.ok(!limited.message.includes('降低 max_tokens'));
 });
 
 // ---- 10001 复判:结构化状态码与"繁忙"文案同族(2026-09-16 补齐,此前该分支
@@ -142,7 +167,7 @@ test('截断两形态: 零字节且等待达网关墙 → 首字节文案(维护
   assert.strictEqual(d.note, 'stream-truncated');
   assert.ok(d.message.includes('未产出首字节'), d.message);
   assert.ok(d.message.includes('等待后重试'), d.message);
-  assert.ok(d.message.includes('减小会话上下文'), d.message);
+  assert.ok(d.message.includes('缩短对话'), d.message);
   // 定稿文案不再带秒数/网关归因/直连建议——排障信息由日志的 idle=Ns 承载
   assert.ok(!d.message.includes('PROXY_UPSTREAM'), d.message);
 });
@@ -155,8 +180,8 @@ test('截断两形态: 中途截断 → 距上一帧时长 + 已交付 KB + 可�
   assert.ok(d.message.includes('截断'), d.message);          // README FAQ 按"截断"检索
   assert.ok(d.message.includes('距上一帧 60s'), d.message);
   assert.ok(d.message.includes('疑似学校网关 60 秒超时'), d.message);
-  assert.ok(d.message.includes('已收内容完整交付到第 12.1 KB'), d.message);
-  assert.ok(d.message.includes('客户端可重试'), d.message);
+  assert.ok(d.message.includes('已发送 12.1 KB'), d.message);
+  assert.ok(d.message.includes('重试'), d.message);
 });
 
 test('截断两形态: 中途截断但无交付字节(聚合路径)不含 KB 句子', () => {
@@ -165,14 +190,14 @@ test('截断两形态: 中途截断但无交付字节(聚合路径)不含 KB 句
   assert.strictEqual(d.note, 'agg-truncated');
   assert.ok(d.message.includes('距上一帧 1s'), d.message);
   assert.ok(!d.message.includes('KB'), d.message);
-  assert.ok(d.message.includes('客户端可重试'), d.message);
+  assert.ok(d.message.includes('重试'), d.message);
 });
 
 test('截断两形态: 中途截断但静默未达网关墙 → 连接中断,不带网关归因', () => {
   const d = describeFailedStream(
     { type: 'protocol-error', reason: 'truncated', idleMs: 5_000, sawBytes: true }, 'stream', CFG, 4_096);
   assert.ok(d.message.includes('距上一帧 5s 后连接中断'), d.message);
-  assert.ok(d.message.includes('客户端可重试'), d.message);
+  assert.ok(d.message.includes('重试'), d.message);
   assert.ok(!d.message.includes('网关'), '短静默的中途截断不是网关读空闲墙,不得归因网关');
 });
 

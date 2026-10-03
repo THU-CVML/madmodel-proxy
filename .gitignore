@@ -1,7 +1,10 @@
-# 运行时产物(诊断/状态,不入库)
+# 运行时产物(诊断/状态,不入库;正常都写在状态目录里,这里逐项兜底)
 last-failed-request.json
+network-choice.json
+tunnel-revive
 *.tmp
 *.stale.*
+*.log
 
 # 凭据与密钥(正常位于 %USERPROFILE%\.madmodel-proxy\,此为防御性兜底)
 api-key
@@ -23,3 +26,6 @@ desktop.ini
 # Node
 node_modules/
 npm-debug.log*
+
+# PID 锁竞争记录
+*.lock.holders/

@@ -7,6 +7,7 @@
 // before/after 钩子——Node 18 的 node:test 根级钩子不生效(18.14.2 CI 实测,
 // 测试带着未初始化的装配直接开跑),t.test 子测试全版本可靠
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 // 环境注入必须在 require config/paths 之前(加载期读取)
 const fs = require('fs');
@@ -110,6 +111,55 @@ test('上游错误判定集成矩阵(mock 上游 + 完整代理实例)', async t
   };
 
   try {
+    await t.test('流式与非流式的完成日志显示首字等待和均速', async () => {
+      const lines = [];
+      const originalLog = console.log;
+      console.log = (...args) => lines.push(args.join(' '));
+      try {
+        for (const stream of [true, false]) {
+          mock.set((req, res) => {
+            res.writeHead(200, { 'content-type': 'text/event-stream' });
+            res.write(`data: ${JSON.stringify({ choices: [{ delta: { role: 'assistant' } }] })}\n\n`);
+            setTimeout(() => {
+              res.end(`data: ${JSON.stringify(CH)}\n\ndata: ${JSON.stringify(USAGE)}\n\ndata: [DONE]\n\n`);
+            }, 20);
+          });
+          assert.strictEqual((await chat(stream)).status, 200);
+        }
+      } finally { console.log = originalLog; }
+      const completed = lines.filter(line => line.includes('token 1/1'));
+      assert.strictEqual(completed.length, 2);
+      for (const line of completed) {
+        assert.match(line, /首字 \d+\.\ds/);
+        assert.match(line, /均速 \d+\.\d tok\/s/);
+      }
+    });
+
+    await t.test('双思考字段经工具流缓冲与非流式交付后均不重复', async () => {
+      const { createAggregator } = require('../core/completion-aggregator');
+      for (const stream of [true, false]) {
+        mock.set((req, res) => sse(res, [
+          JSON.stringify({ choices: [{ index: 0, delta: { reasoning: '先想', reasoning_content: '先想' } }] }),
+          JSON.stringify({ choices: [{ index: 0, delta: { reasoning: '再想', reasoning_content: '再想', content: '答案' } }] }),
+          JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }),
+        ]));
+        const r = await chat(stream, { model: 'DeepSeek-V4.1-Flash', tools: [{ type: 'function',
+          function: { name: 'read', parameters: { type: 'object', properties: {} } } }] });
+        assert.strictEqual(r.status, 200);
+        let result = r.json;
+        if (stream) {
+          const agg = createAggregator();
+          for (const line of r.text.split('\n')) {
+            if (line.startsWith('data: ') && line !== 'data: [DONE]') agg.feed(JSON.parse(line.slice(6)));
+          }
+          assert.ok(r.text.includes('[DONE]'));
+          result = agg.result();
+        }
+        assert.strictEqual(result.choices[0].message.reasoning_content, '先想再想');
+        assert.strictEqual(result.choices[0].message.content, '答案');
+      }
+    });
+
     await t.test('正常流式: 200 SSE 透传,内容与 [DONE] 完整', async () => {
       mock.set((req, res) => sse(res, [JSON.stringify(CH), JSON.stringify(USAGE)]));
       const r = await chat(true);
@@ -125,20 +175,18 @@ test('上游错误判定集成矩阵(mock 上游 + 完整代理实例)', async t
       assert.strictEqual(r.json.choices?.[0]?.message?.content, 'ok');
     });
 
-    // ---- R1(1.9.2):含 image_url 的请求在本地 400,不发上游 ----
-    await t.test('R1: 含 image_url 的会话历史 → 本地 400,不触达上游', async () => {
+    // ---- 含图请求透传(1.9.2 的本地预检已移除:目标模型支持视觉,不再拦) ----
+    await t.test('含 image_url 的会话历史照常转发上游(本地不再拦截)', async () => {
       let upstreamHits = 0;
       mock.set((req, res) => { upstreamHits++; sse(res, [JSON.stringify(CH), JSON.stringify(USAGE)]); });
       const r = await chat(false, { messages: [
         { role: 'user', content: [{ type: 'text', text: '看这张图' }, { type: 'image_url', image_url: { url: 'data:image/png;base64,AA' } }] },
       ] });
-      assert.strictEqual(r.status, 400);
-      assert.strictEqual(upstreamHits, 0, '含图请求不得转发到上游');
-      assert.ok(r.json.error.message.includes('图片'), r.json.error.message);
-      assert.ok(r.json.error.message.includes('新开一个会话'), r.json.error.message);
+      assert.strictEqual(r.status, 200, '含图请求应透传,不再本地 400');
+      assert.strictEqual(upstreamHits, 1, '含图请求应到达上游');
     });
 
-    await t.test('R1: 纯文本与纯 text 段的 content 数组照常放行(不误伤)', async () => {
+    await t.test('纯文本与纯 text 段的 content 数组照常放行', async () => {
       mock.set((req, res) => sse(res, [JSON.stringify(CH), JSON.stringify(USAGE)]));
       const a = await chat(false, { messages: [{ role: 'user', content: '纯文本' }] });
       assert.strictEqual(a.status, 200);
@@ -208,7 +256,7 @@ test('上游错误判定集成矩阵(mock 上游 + 完整代理实例)', async t
       // 700ms 静默远未达网关 60s 墙:连接中断形态,不归因网关(归因边界见 errors.js)
       assert.ok(r.json.error.message.includes('连接中断'), r.json.error.message);
       assert.ok(!r.json.error.message.includes('网关'), r.json.error.message);
-      assert.ok(r.json.error.message.includes('已收 1 块'), r.json.error.message);
+      assert.ok(r.json.error.message.includes('重试'), r.json.error.message);
       assert.ok(Date.now() - t0 >= 700, '文案里的时长应来自真实等待');
     });
 
@@ -318,7 +366,7 @@ test('上游错误判定集成矩阵(mock 上游 + 完整代理实例)', async t
       const t0 = Date.now();
       const r = await chat(false);
       assert.strictEqual(r.status, 502);
-      assert.ok(r.json.error.message.includes('等待预算'), r.json.error.message);
+      assert.ok(r.json.error.message.includes('2s 内未完成续期'), r.json.error.message);
       assert.ok(Date.now() - t0 >= 1800, `应在预算附近返回,实际 ${Date.now() - t0}ms`);
     });
   } finally {

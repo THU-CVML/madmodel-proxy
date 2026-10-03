@@ -2,10 +2,38 @@
 
 本仓库包含以下第三方软件的衍生代码。
 
+## DeepSeek-V3 tokenizer(vendored)
+
+- 文件:`vendor/deepseek-tokenizer.json`,来自 [HuggingFace `deepseek-ai/DeepSeek-V3`](https://huggingface.co/deepseek-ai/DeepSeek-V3) 的 `tokenizer.json`,2026-09-10 下载,未做任何修改
+- 该仓库为双许可:代码 MIT(`LICENSE-CODE`),模型权重另受 Model License 约束。tokenizer.json 属仓库数据文件,按上游标注的 MIT 提供
+- 许可:MIT,版权人 DeepSeek(`Copyright (c) 2023 DeepSeek`),全文如下:
+
+```
+Copyright (c) 2023 DeepSeek
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 ## sm-crypto(vendored)
 
 - 文件:`sm2.js`,来自 [sm-crypto](https://github.com/JuneAndGreen/sm-crypto) **v0.3.13** 的 `dist/sm2.js`
-- 与上游发布产物**逐字节相同**(md5 `da564086e629c5dcfb7934b6920b0323`),除本仓库在文件顶部添加的版权说明块外无任何修改
+- 除文件顶部添加的版权说明块外，代码与上游发布产物逐字节相同；去掉该说明块后的 MD5 为 `da564086e629c5dcfb7934b6920b0323`
 - 许可:MIT,版权人 june01,全文如下:
 
 ```

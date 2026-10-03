@@ -1,23 +1,18 @@
 // platform/process-lock.js
-// PID 锁实现(watch 单实例锁 + 认证操作锁共用),纯 Node 跨平台。
-// 争用与原子安装由 file-store 的 claimFile 承担,这里只定义"什么算有效锁":
-// 自己的 PID,或一个仍然存活的 PID。空/垃圾内容(旧版本中断写入、升级遗留)
-// 与死 PID 一律视为可接管。
-// 已知取舍:PID 被系统复用时会误判为"持有者存活"——fail-safe 方向(拒绝启动
-// 而非双跑),按提示删锁即可恢复,这是无原生进程标识 API 下的合理代价。
-// 接口供 auth-service / CLI 使用:
-//   processLock.acquirePidLock(file) -> { ok } | { ok: false, pid }
-//   processLock.releasePidLock(file)
-//   processLock.pidOf(content) / isAlive(pid)(诊断命令用)
+// 每个竞争者发布独立记录，按 Bakery 票号仲裁，不搬动他人的锁。
+// 状态文件仍保存 PID，兼容 status 与旧版本；PID 被复用时保守视为存活。
 
 'use strict';
 
 const fs = require('fs');
-const { claimFile } = require('./file-store');
+const path = require('path');
+const { randomUUID } = require('crypto');
+const { atomicWrite } = require('./file-store');
+const held = new Map();
 
 function pidOf(content) {
   const pid = Number(String(content).trim());
-  return Number.isInteger(pid) && pid > 0 ? pid : 0;
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : 0;
 }
 
 function isAlive(pid) {
@@ -27,21 +22,102 @@ function isAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
 }
 
-function acquirePidLock(file) {
-  const claim = claimFile(file, String(process.pid), content => {
-    const pid = pidOf(content);
-    return pid === process.pid || (pid > 0 && isAlive(pid));
-  });
-  if (claim.installed) return { ok: true };
-  const pid = pidOf(claim.content);
-  // 同进程重复获取(上一次 release 未成功)视为已持有
-  return pid === process.pid ? { ok: true } : { ok: false, pid };
+function remove(file) {
+  try { fs.unlinkSync(file); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+}
+
+function readParticipants(dir) {
+  const entries = [];
+  for (const name of fs.readdirSync(dir)) {
+    const match = /^(\d+)\.[\da-f-]+\.json$/.exec(name);
+    if (!match) continue;
+    const file = path.join(dir, name);
+    const pid = pidOf(match[1]);
+    if (!isAlive(pid)) { remove(file); continue; }
+    try {
+      const entry = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (!entry || !Number.isSafeInteger(entry.ticket) || entry.ticket < 0 || typeof entry.choosing !== 'boolean') {
+        throw new Error('锁记录损坏，请停止服务后清理对应的 .holders 目录。');
+      }
+      entries.push({ ...entry, name, pid });
+    } catch (e) {
+      if (e.code !== 'ENOENT') { e.lockPid = pid; throw e; }
+    }
+  }
+  return entries;
+}
+
+async function retryFileAccess(action, pid) {
+  const deadline = Date.now() + 2000;
+  for (;;) {
+    try { return action(); } catch (e) {
+      // Windows 的打开/替换/删除窗口可能返回 EPERM。读取时重试整个快照，
+      // 不能跳过未读出的票号，否则可能与持有者同时进入临界区。
+      if (!(e.lockPid || pid) || !['EPERM', 'EACCES', 'EBUSY'].includes(e.code)) throw e;
+      if (Date.now() >= deadline) { e.code = 'LOCK_BUSY'; e.lockPid ||= pid; throw e; }
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  }
+}
+
+async function acquirePidLock(file) {
+  file = path.resolve(file);
+  if (held.has(file)) return { ok: false, pid: process.pid };
+  const dir = `${file}.holders`;
+  fs.mkdirSync(dir, { recursive: true });
+  const name = `${process.pid}.${randomUUID()}.json`;
+  const marker = path.join(dir, name);
+  const state = { marker, acquired: false };
+  held.set(file, state);
+  try {
+    // 先发布 choosing，再取票号。其他竞争者等 choosing 结束后比较。
+    // 唯一文件名从不复用，清除死进程记录不会误删新持有者。
+    await retryFileAccess(() => atomicWrite(marker, JSON.stringify({ choosing: true, ticket: 0 })), process.pid);
+    const ticket = (await retryFileAccess(() => readParticipants(dir))).reduce((max, p) => Math.max(max, p.ticket), 0) + 1;
+    if (!Number.isSafeInteger(ticket)) throw new Error('锁票号超出范围，请停止服务后清理锁目录。');
+    await retryFileAccess(() => atomicWrite(marker, JSON.stringify({ choosing: false, ticket })), process.pid);
+    const deadline = Date.now() + 2000;
+    for (;;) {
+      const others = (await retryFileAccess(() => readParticipants(dir))).filter(p => p.name !== name);
+      const choosing = others.find(p => p.choosing);
+      if (choosing) {
+        if (Date.now() >= deadline) return { ok: false, pid: choosing.pid };
+        await new Promise(resolve => setTimeout(resolve, 10));
+        continue;
+      }
+      const earlier = others.find(p => p.ticket < ticket || (p.ticket === ticket && p.name < name));
+      if (earlier) return { ok: false, pid: earlier.pid };
+      break;
+    }
+    // 只有仲裁成功者才能更新兼容 PID 文件；运行中的旧版本也会阻止获取。
+    let previous = 0;
+    try { previous = pidOf(fs.readFileSync(file, 'utf8')); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    if (previous && previous !== process.pid && isAlive(previous)) return { ok: false, pid: previous };
+    await retryFileAccess(() => atomicWrite(file, String(process.pid)), process.pid);
+    state.acquired = true;
+    return { ok: true };
+  } catch (e) {
+    if (e.code === 'LOCK_BUSY') return { ok: false, pid: e.lockPid };
+    throw e;
+  } finally {
+    if (!state.acquired) {
+      await retryFileAccess(() => remove(marker), process.pid);
+      held.delete(file);
+    }
+  }
 }
 
 function releasePidLock(file) {
+  file = path.resolve(file);
+  const state = held.get(file);
+  if (!state) return;
+  // 先清状态文件，再退票，避免新持有者撞见旧 PID。
   try {
-    if (pidOf(fs.readFileSync(file, 'utf8')) === process.pid) fs.unlinkSync(file);
-  } catch (e) { /* 无锁文件 */ }
+    if (state.acquired && pidOf(fs.readFileSync(file, 'utf8')) === process.pid) remove(file);
+  } catch { /* 残留 PID 可由同进程重取或死 PID 接管 */ }
+  try { remove(state.marker); } catch { /* 死进程记录由下次获取清理 */ }
+  held.delete(file);
 }
 
+process.once('exit', () => { for (const file of held.keys()) releasePidLock(file); });
 module.exports = { pidOf, isAlive, acquirePidLock, releasePidLock };

@@ -1,5 +1,9 @@
 // core/tokenizer.js
-// DeepSeek 分词器的本地精确计 token(纯逻辑)。2026-09-10 实测确认学校
+// DeepSeek 分词器的本地精确计 token。算法是纯逻辑,但**加载期会读词表**
+// (vendor/deepseek-tokenizer.json,7.8MB,首次 getTokenizer 时读入并建索引)
+// ——与同目录其他模块不同,本模块接触 fs,刻意为之:词表必须随仓库分发,
+// 不能依赖网络。除此之外无外部依赖、无 I/O。
+// 2026-09-10 实测确认学校
 // madmodel 的 DeepSeek-V4-Flash-0731 沿用 DeepSeek-V3 公开分词器
 // (HuggingFace,MIT,vendor/deepseek-tokenizer.json):本地计数与上游
 // usage.prompt_tokens 在 24 万 token 级 payload 上逐个吻合,差异仅为
@@ -15,6 +19,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { readReasoningDelta } = require('./thinking');
 
 // ---- byte-level 字母表(GPT-2 同构):可打印 ASCII + ¡-¬ + ®-ÿ 原样,其余字节映射到 256+ ----
 function buildByteToUni() {
@@ -201,13 +206,23 @@ function createTokenizer(model, opts = {}) {
     return c;
   }
 
-  // 单条消息的可计内容:content 为字符串或 OpenAI 分段数组(仅计文本段,
-  // 其他段(如图片)本模型不进上下文)
+  // 单条消息的可计内容:content 为字符串或 OpenAI 分段数组。
+  // **只计文本段,图片段计 0**——这是计量下界,不是准确值:目标模型
+  // DeepSeek-V4-Flash-Vision-Exp 支持视觉,图片会真的进上下文并消耗 token
+  // (2026-09-27 实测:64x64 图上游报 123 prompt_tokens,其中图贡献约 116;
+  // 本地算式对这个 payload 只给 7)。故含图请求的 promptTokens 偏低,
+  // fitTokenBudget 可能放行本应本地 413 的请求——兜底是 config.bodyLimit
+  // (950KB)先挡住超大图,且真超限时 core/errors.js 的 busyHint 复判给 413
+  // 而非含糊的 429(不会无限重试)。为图片段补一个保守常数会让纯文本请求
+  // 也背上虚高成本,故不做;此缺口如实记录于此
   function countMessage(m) {
     const c = m?.content;
     let total = typeof c === 'string' ? countText(c)
       : Array.isArray(c) ? c.reduce((s, p) => s + (typeof p?.text === 'string' ? countText(p.text) : 0), 0)
         : 0;
+    // 工具循环会把历史思考一并回传；即使上游有时丢弃旧轮次，也按保守口径计入。
+    // 同义字段只计一次，正文中的普通 text 则保持独立。
+    if (m?.role === 'assistant') total += countText(readReasoningDelta(m) || '');
     if (Array.isArray(m?.tool_calls)) {
       for (const tc of m.tool_calls) {
         total += countText(tc?.function?.name || '');

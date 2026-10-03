@@ -29,9 +29,13 @@ const path = require('path');
 const { STATE_DIR } = require('./platform/paths');
 const { atomicWrite } = require('./platform/file-store');
 
-// 校园网直连端点。**全项目第一处代码级出现**(此前只在 README/CHANGELOG/测试
-// 里以文档形式出现);隧道默认值则由 config.js 依 madmodel-auth.js 的前缀常量
-// 拼出。改这个字符串需同步 README 的「校内 / 校外」与环境变量表。
+// 校园网直连端点。代码里还有第二处硬编码:start.cmd 的动作行(SET 行,
+// 因 cmd 不能 require 本模块——paths.js 文件头已注明同一限制)。改这个字符串
+// 要同步四处:start.cmd:87(漏改的后果是"选了校园网却走隧道")、本文件
+// isCampusUpstream 里的同域前缀(漏改会让直连判定与端点定义漂移)、
+// test/network-choice.test.js 与 test/config-keepalive.test.js 的断言、
+// README 的「校内 / 校外」与环境变量表(隧道默认值由 config.js 依
+// madmodel-auth.js 的前缀常量拼出,不在这里)
 const CAMPUS_UPSTREAM = 'https://madmodel.cs.tsinghua.edu.cn/v1/chat/completions';
 
 const MODE_CAMPUS = 'campus';
@@ -125,9 +129,9 @@ function normalizeArg(raw) {
 // 询问文本与提示(中文集中在这里,由 Node 输出;start.cmd 只负责按单键)
 const PROMPT_LINES = [
   '',
-  '首次使用:你的网络环境是?(之后不再询问)',
-  '  [1] 校园网',
-  '  [2] 校外',
+  '请选择网络方式（会保存；运行中可用 campus / offcampus 切换）',
+  '  [1] 校园网直连',
+  '  [2] WebVPN 隧道（校外或不确定时选择）',
 ];
 // 选完之后回执
 function chosenLines(campus) {

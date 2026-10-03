@@ -2,6 +2,7 @@
 // verdict。隧道对未认证会话的固定形态是 3xx 跳登录页;2xx/4xx/5xx 都说明
 // 请求已穿过隧道(会话有效)。网络层错误不在此函数范围(调用方归为 'network')。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

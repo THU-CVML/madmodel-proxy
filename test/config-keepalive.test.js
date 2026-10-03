@@ -4,6 +4,7 @@
 // 导出单一来源,tunnelMode 与 keepaliveUrl 共用同一判定。
 // config 在 require 时读取 process.env,测试用 PROXY_UPSTREAM + 清缓存重载。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

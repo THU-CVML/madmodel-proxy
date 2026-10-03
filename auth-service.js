@@ -13,13 +13,14 @@ const processLock = require('./platform/process-lock');
 const { createFileWakeup } = require('./platform/file-store');
 const { Scheduler } = require('./core/scheduler');
 const config = require('./config');
+const { isProxyRunning } = require('./core/proxy-status');
 const { TOKEN_FILE, CREDS_FILE, WATCH_LOCK, AUTH_LOCK, TUNNEL_REVIVE } = require('./platform/paths');
 
 // 认证操作锁(login/once 与 watch 续期共用):用户手动 login 时 watch 恰好在
 // 走登录链,会触发重复二次认证且 token 互相覆盖。watch 抢不到锁按瞬时错误
 // 短退避重试(scheduler 的 AUTH_BUSY 分支),人工操作不受影响
 async function withAuthLock(fn) {
-  const r = processLock.acquirePidLock(AUTH_LOCK);
+  const r = await processLock.acquirePidLock(AUTH_LOCK);
   if (!r.ok) {
     const e = new Error(`另一认证操作进行中(PID ${r.pid}),请稍后重试`);
     e.code = 'AUTH_BUSY';
@@ -101,26 +102,24 @@ function stamp() {
 // 只支持停服后清理,不做代停(进程身份确认与停止顺序的复杂度留给真实
 // 需要时)。远端不撤销:学校侧登录状态活到自然过期(约 6 小时)
 async function logout() {
-  // ① 代理在跑?(/v1/models 健康探测,与 start.cmd 同一判定)
-  try {
-    const r = await fetch(`http://127.0.0.1:${config.port}/v1/models`, { signal: AbortSignal.timeout(2000) });
-    const j = await r.json().catch(() => null);
-    if (r.status === 200 && Array.isArray(j?.data)) {
-      throw new Error('代理仍在运行。请先关闭 start.cmd 窗口(或 Ctrl+C),再执行 logout');
-    }
-  } catch (e) {
-    if (e.message.includes('logout')) throw e; // 自身的指引错误原样上抛
-    /* 探测失败 = 未运行,继续 */
+  if (await isProxyRunning(config.port)) {
+    throw new Error('代理仍在运行。请先用 Ctrl+C 停止代理与续期守护，再执行 logout');
   }
   // ② watch 在跑?(锁 PID 探活)
   try {
     const lockPid = processLock.pidOf(fs.readFileSync(WATCH_LOCK, 'utf8'));
     if (lockPid > 0 && processLock.isAlive(lockPid)) {
-      throw new Error(`watch 续期守护仍在运行(PID ${lockPid})。请先关闭 start.cmd 窗口,再执行 logout`);
+      const e = new Error(`watch 续期守护仍在运行(PID ${lockPid})。请先用 Ctrl+C 停止续期守护,再执行 logout`);
+      e.serviceRunning = true;
+      throw e;
     }
   } catch (e) {
-    if (e.message.includes('logout')) throw e;
-    /* 无锁文件 = 未运行,继续 */
+    if (e.serviceRunning) throw e; // 自身的指引错误原样上抛
+    // 只有"锁文件不存在"才等于未运行。其余读取失败(权限、目录被占、
+    // IO 错误)不是"没在跑"的证据——静默放行会在这道闸本该校验的场景下
+    // 直接清掉凭据。上抛让用户看到原因再决定(2026-09-22 审阅指出)
+    if (e.code !== 'ENOENT') throw e;
+    /* ENOENT = 无锁文件,未运行,继续 */
   }
   // ③ 持认证锁清除(与 login/once 互斥,防进行中的续期写回)
   return withAuthLock(() => {
@@ -132,10 +131,9 @@ async function logout() {
 // watch 守护:单实例锁 + 调度器装配。锁的争用与提示属 CLI 决策,留在本层
 let activeScheduler = null;
 async function watch() {
-  const lock = processLock.acquirePidLock(WATCH_LOCK);
+  const lock = await processLock.acquirePidLock(WATCH_LOCK);
   if (!lock.ok) {
-    console.error(`已有 watch 守护在运行(PID ${lock.pid},锁: ${WATCH_LOCK}),不重复启动。`);
-    console.error('锁为死进程残留时,删除该锁文件后重试。');
+    console.error(`续期服务已在运行（PID ${lock.pid}），跳过启动。`);
     process.exit(0);
   }
   process.on('exit', () => processLock.releasePidLock(WATCH_LOCK));
@@ -149,7 +147,7 @@ async function watch() {
     process.exit(130);
   });
 
-  console.log('madmodel token 自动续期守护进程已启动(PID ' + process.pid + ')');
+  console.log('自动续期已启动');
   // TUNNEL_REVIVE 一并纳入监听:代理遇隧道会话被拒(302→/login,如网络切换
   // 后 WebVPN 会话绑定失效)时写该标志,文件事件把 wait 提前唤醒
   const wakeup = createFileWakeup([TOKEN_FILE, CREDS_FILE, TUNNEL_REVIVE]);
@@ -185,7 +183,7 @@ async function watch() {
       }
       return;
     }
-    console.log('[' + stamp() + '] 代理报告隧道会话被拒,立即探活(网络切换场景常见)');
+    console.log('[' + stamp() + '] WebVPN 会话被拒绝，正在检查');
     scheduler.pokeKeepalive();
   };
   // 隧道会话保活:带存储的 cookie 探活 WebVPN 隧道(探测本身重置隧道空闲

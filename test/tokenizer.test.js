@@ -6,6 +6,7 @@
 // 上游漂移需重新以 usage.prompt_tokens 对测(勘误:此前版本在此宣称会红,
 // 系表述错误)。
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');
@@ -60,6 +61,22 @@ test('prompt 计量: 单消息各形态与 oracle 逐个相等', () => {
 
 test('prompt 计量: 空内容单消息 = 模板开销 4(oracle 实测)', () => {
   assert.strictEqual(tk.countPromptTokens({ messages: [{ role: 'user', content: '' }] }), 4);
+});
+
+test('prompt 计量: 工具循环中的历史思考计入输入，别名不重复计数', () => {
+  const messages = [
+    { role: 'user', content: '计算结果' },
+    { role: 'assistant', content: '调用工具', tool_calls: [{ id: 'c', type: 'function',
+      function: { name: 'calculate', arguments: '{}' } }] },
+    { role: 'tool', tool_call_id: 'c', content: '391' },
+  ];
+  const base = tk.countPromptTokens({ messages });
+  const reasoning = '需要先计算乘法。'.repeat(100);
+  for (const fields of [{ reasoning_content: reasoning }, { reasoning },
+    { reasoning_content: reasoning, reasoning }, { reasoning_content: '', reasoning }]) {
+    const history = messages.map(m => m.role === 'assistant' ? { ...m, ...fields } : m);
+    assert.strictEqual(tk.countPromptTokens({ messages: history }) - base, tk.countText(reasoning));
+  }
 });
 
 test('prompt 计量: system 前置不额外计(oracle [s,u]=4 开销同 [u])', () => {

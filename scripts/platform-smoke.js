@@ -6,12 +6,8 @@
 //   1) 凭据与 token 的写入-读回往返(真实调用当前平台的存储原语)
 //   2) proxy.js 无 token 启动并应答 /v1/models
 //   3) refresh-token.js watch 在无凭据时的调度循环(锁/文件唤醒/调度器)
-// 隔离边界(1.8.1 起,修复了此前 macOS 与生产共用钥匙串条目的问题):
-//   - 状态目录:MADMODEL_STATE_DIR 重定向(三平台,文件形态的存储全部隔离)
-//   - macOS 钥匙串:MADMODEL_KEYCHAIN_SERVICE 注入独立测试 service,
-//     与生产条目(默认名)完全隔离;另设双哨兵验证隔离有效——第三命名空间
-//     哨兵恒建,伪生产哨兵仅在默认 service 为空时创建(真机上有真实凭据
-//     则绝不触碰);清理只删本脚本自建的条目
+// 测试隔离：清理继承的路径与上游覆盖，状态目录及钥匙串每次运行独立。
+// 哨兵只用测试命名空间，并发运行互不清理。
 // CI 三平台(ubuntu/macos/windows)各跑一次;本地跑也不会影响在跑的服务
 // (独立状态目录 + 独立端口)。
 //   node scripts/platform-smoke.js
@@ -25,6 +21,8 @@ const os = require('os');
 const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
+const { randomUUID } = require('crypto');
+const { createTestEnv, applyTestEnv } = require('./isolated-env');
 let failed = 0;
 
 function ok(name) { console.log(`✓ ${name}`); }
@@ -87,9 +85,8 @@ function stop(child) {
 // macOS 钥匙串隔离(1.8.1):测试与哨兵的 service 名。生产默认名是
 // 'madmodel-proxy'(见 platform/macos/credentials.js),测试经
 // MADMODEL_KEYCHAIN_SERVICE 指到独立命名空间
-const KC_TEST_SERVICE = 'madmodel-proxy-smoke-test';
-const KC_SENTINEL_SERVICE = 'madmodel-proxy-smoke-sentinel';
-const PROD_SERVICE = 'madmodel-proxy';
+const KC_TEST_SERVICE = `madmodel-smoke-${randomUUID()}`;
+const KC_SENTINEL_SERVICE = `madmodel-sentinel-${randomUUID()}`;
 
 function secRun(args) {
   const { execFileSync } = require('child_process');
@@ -107,35 +104,18 @@ async function main() {
   // macOS 的 credentials 模块同样在加载期读 MADMODEL_KEYCHAIN_SERVICE
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'madmodel-smoke-'));
   const port = await freePort();
-  if (process.platform === 'darwin') {
-    process.env.MADMODEL_KEYCHAIN_SERVICE = KC_TEST_SERVICE;
-  }
-  const env = { ...process.env, MADMODEL_STATE_DIR: stateDir, PROXY_PORT: String(port) };
-  process.env.MADMODEL_STATE_DIR = stateDir;
+  const env = createTestEnv(stateDir, { PROXY_PORT: String(port), MADMODEL_KEYCHAIN_SERVICE: KC_TEST_SERVICE });
+  applyTestEnv(env);
 
   const credentials = require('../platform/credentials');
   const cfg = require('../config');
 
-  // ---- 0) macOS 哨兵就绪(在任何凭据操作之前) ----
-  // 第三命名空间哨兵恒建;伪生产哨兵仅在默认 service 为空时创建——
-  // 真机上已有真实凭据则跳过,绝不写入生产命名空间
-  let prodSentinelCreated = false;
-  if (process.platform === 'darwin') {
-    secRun(['add-generic-password', '-U', '-s', KC_SENTINEL_SERVICE, '-a', 'password', '-w', secB64('sentinel-v0')]);
-    const prodVacant = secRead(PROD_SERVICE, 'password') === null && secRead(PROD_SERVICE, 'token') === null;
-    if (prodVacant) {
-      // 伪生产哨兵刻意不用 -U:"空检查与创建之间的窗口内若有真实进程恰好
-      // 写入凭据,-U 会把它改写成哨兵、随后被 finally 删除——正是要防的
-      // 损毁。不带 -U 的 add 在条目已存在时原子失败,捕到即放弃哨兵
-      try {
-        secRun(['add-generic-password', '-s', PROD_SERVICE, '-a', 'password', '-w', secB64('prod-sentinel-v0')]);
-        prodSentinelCreated = true;
-      } catch (e) { /* 窗口内被真实写入:不覆盖,放弃伪生产哨兵 */ }
-    }
-    ok('钥匙串哨兵就绪(第三命名空间' + (prodSentinelCreated ? '+伪生产' : ',真机有真实条目则跳过伪生产') + ')');
-  }
-
   try {
+  // 哨兵也使用独立命名空间；不读取、创建或删除生产钥匙串条目。
+  if (process.platform === 'darwin') {
+    secRun(['add-generic-password', '-s', KC_SENTINEL_SERVICE, '-a', 'password', '-w', secB64('sentinel-v0')]);
+    ok('钥匙串隔离哨兵就绪');
+  }
   // ---- 1) 凭据与 token 存储往返(非 ASCII 秘密顺带验证编码路径) ----
   const PW = 'pass-马Φ"quote\\slash';
   try {
@@ -162,9 +142,6 @@ async function main() {
   if (process.platform === 'darwin') {
     try {
       assert(secRead(KC_SENTINEL_SERVICE, 'password') === 'sentinel-v0', '第三命名空间哨兵被测试操作改写(隔离失效)');
-      if (prodSentinelCreated) {
-        assert(secRead(PROD_SERVICE, 'password') === 'prod-sentinel-v0', '伪生产哨兵被测试操作改写(隔离失效!)');
-      }
       ok('哨兵复核:测试实例未触碰任何隔离命名空间');
     } catch (e) { bad('哨兵复核', e); }
   }
@@ -226,7 +203,6 @@ async function main() {
         [KC_TEST_SERVICE, ['password', 'token', 'webvpn-cookie']],
         [KC_SENTINEL_SERVICE, ['password']],
       ];
-      if (prodSentinelCreated) targets.push([PROD_SERVICE, ['password']]);
       for (const [svc, accounts] of targets) {
         for (const a of accounts) {
           try { secRun(['delete-generic-password', '-s', svc, '-a', a]); } catch (e) { /* 条目不存在 */ }

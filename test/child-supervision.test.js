@@ -1,6 +1,7 @@
 // test/child-supervision.test.js — 退出形态分类(dashboard 重启策略的依据)。
 // 退出码协议:2=需人工(停止重启+等恢复),0+短运行=正常退出,其余=重启策略
 'use strict';
+require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');

@@ -4,11 +4,13 @@
 
 'use strict';
 
-function createAggregator(model = '') {
+const { readReasoningDelta } = require('./thinking');
+
+function createAggregator(model = '', thinkingField = null) {
   return {
     id: '', model,
     content: '', reasoning: '',
-    toolCalls: {}, // index → {id, type, function:{name, arguments}}
+    toolCalls: Object.create(null), // index → {id, type, function:{name, arguments}}
     finish: null, usage: null, created: 0,
     feed(obj) {
       if (obj.id) this.id = obj.id;
@@ -20,10 +22,19 @@ function createAggregator(model = '') {
       if (ch.finish_reason) this.finish = ch.finish_reason;
       const d = ch.delta || {};
       if (typeof d.content === 'string') this.content += d.content;
-      if (typeof d.reasoning_content === 'string') this.reasoning += d.reasoning_content;
+      // 思考字段名逐模型不同(见 thinking.js 的 REASONING_FIELDS):只认
+      // `reasoning_content` 会让 qwen 的 `reasoning` 整段丢掉,非流式交付的
+      // 回复里就永远没有思考。交付名统一为 `reasoning_content`(下方 result)
+      const r = readReasoningDelta(d, thinkingField);
+      if (r !== null) this.reasoning += r;
       if (Array.isArray(d.tool_calls)) {
         for (const tc of d.tool_calls) {
           const i = tc.index != null ? tc.index : 0;
+          if (!Number.isSafeInteger(i) || i < 0) {
+            const error = new Error('上游工具调用索引无效');
+            error.code = 'UPSTREAM_TOOL_INDEX';
+            throw error;
+          }
           if (!this.toolCalls[i]) this.toolCalls[i] = { id: '', type: 'function', function: { name: '', arguments: '' } };
           if (tc.id) this.toolCalls[i].id = tc.id;
           if (tc.function) {

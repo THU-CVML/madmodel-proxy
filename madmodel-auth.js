@@ -63,9 +63,14 @@ const WEBVPN_OAUTH_LOGIN = () => `${WEBVPN_PREFIX}/login?oauth_login=true`;
 const ID_LOGIN_CHECK = () => `${ID_PREFIX}/do/off/ui/auth/login/check`;
 const ID_DOUBLE_AUTH = () => `${ID_PREFIX}/b/doubleAuth/login`;
 const ID_SAVE_FINGER = () => `${ID_PREFIX}/b/doubleAuth/personal/saveFinger`;
+// 末段是 info 门户在 id 域的 appId(学校侧固定值,非本仓库生成)
 const ID_INFO_APP_FORM = () => `${ID_PREFIX}/do/off/ui/auth/login/form/10000ea055dd8d81d09d5a1ba55d39ad/0`;
+// 隧道自带接口(非学校业务接口):按 host/scheme/path 向隧道换取该应用的 cookie
 const GET_COOKIE_URL = WEBVPN_PREFIX +
   '/wengine-vpn/cookie?method=get&host=info.tsinghua.edu.cn&scheme=https&path=/f/info/gxfw_fg/common/index';
+// INFO_PREFIX / MADMODEL_VPN_PREFIX 末段的 HASH:hex(IV)+hex(AES-128-CFB(主机名)),
+// 密钥与 IV 同为 ASCII 口令 wrdvpnisthebest!(wengine 固定常量)。学校换主机名时
+// 按 test/tunnel-prefix.test.js 的 derive() 重新生成
 const INFO_PREFIX = WEBVPN_PREFIX +
   '/https/77726476706e69737468656265737421f9f9479369247b59700f81b9991b2631506205de';
 const ROAMING_URL = `${INFO_PREFIX}/b/yyfw/vyyfwxx/info/portal_fg/common/onlineAppRedirect`;
@@ -76,6 +81,12 @@ const MADMODEL_AUTH_CHECK_URL = `${MADMODEL_VPN_PREFIX}/model-api/auth-login/che
 // 保活探测(keepaliveUrl)共用的探测目标——单一来源,防两处路径漂移后
 // "登录判定与保活探的不是同一条路径"的静默错位
 const MADMODEL_TUNNEL_MODELS_URL = `${MADMODEL_VPN_PREFIX}/v1/models`;
+// 取隧道 cookie 的作用域。**必须是隧道前缀**(而非 webvpn 域根):隧道的会话
+// cookie 可能设在 Path=/https/<hash> 这种深路径上,按根路径匹配会漏掉它;
+// 按隧道前缀匹配同时也排除同域其他应用(如 info 门户)的 cookie。
+// 导出给上游与会话探测共用此常量,防两处各写一个 URL 后悄悄漂开
+const TUNNEL_COOKIE_SCOPE = `${MADMODEL_VPN_PREFIX}/`;
+// madmodel 应用在 info 门户的漫游 ID(门户页面里的 yyfwid 参数值)
 const MADMODEL_ROAMING_ID = '19D04E39D96B36C494F2E48A1A4741FD';
 
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -133,12 +144,36 @@ class CookieJar {
       const value = pair.slice(eq + 1).trim();
       if (!name) continue;
       let cpath = defaultCookiePath(url);
+      // 删除 cookie 有三种标准写法,只看"值为空"会漏掉后两种,于是服务端
+      // 已经作废的会话 cookie 会被我们继续发出去(2026-09-22 实测:
+      // Max-Age=0 后旧值仍在)。两种都要识别:
+      //   Max-Age:相对秒数,<=0 即立即过期
+      //   Expires:绝对时间,已过去即过期
+      // 按 RFC 6265 §5.3,**两者并存时 Max-Age 优先**,Expires 被忽略——否则
+      // "过去的 Expires + 正数 Max-Age"这种组合会被误删(它本身自相矛盾,合规
+      // 实现是按 Max-Age 保留)。故这里先扫全属性再判定,不能边扫边置位
+      let maxAge = null;
+      let expiresAt = null;
       for (let i = 1; i < parts.length; i++) {
-        const pm = /^Path=(.*)$/i.exec(parts[i].trim());
-        if (pm) cpath = pm[1] || '/';
+        const attr = parts[i].trim();
+        const pm = /^Path=(.*)$/i.exec(attr);
+        if (pm) { cpath = pm[1] || '/'; continue; }
+        // 容忍空格与引号包裹、以及显式 + 号:服务端的写法并不总是最规范形态,
+        // 收紧到只认 "-?\d+" 会静默漏删(2026-09-22 实测 Max-Age = 0 /
+        // Max-Age=+0 / Max-Age="0" 三种都不生效)
+        const mm = /^Max-Age\s*=\s*"?([+-]?\d+)"?$/i.exec(attr);
+        if (mm) { maxAge = Number(mm[1]); continue; }
+        const em = /^Expires\s*=\s*(.+)$/i.exec(attr);
+        if (em) {
+          const when = Date.parse(em[1]);
+          if (Number.isFinite(when)) expiresAt = when;
+        }
       }
+      const expired = maxAge !== null
+        ? maxAge <= 0
+        : (expiresAt !== null && expiresAt <= Date.now());
       const existing = jar.findIndex(c => c.name === name && c.path === cpath);
-      if (!value) {
+      if (!value || expired) {
         if (existing !== -1) jar.splice(existing, 1);
       } else if (existing === -1) {
         jar.push({ name, value, path: cpath });
@@ -179,12 +214,7 @@ class CookieJar {
 // resolveUrl:相对/绝对跳转解析(避免依赖 URL 类的怪异形态)
 function resolveUrl(base, target) {
   if (!target) return base;
-  if (/^https?:\/\//i.test(target)) return target;
-  const m = /^(https?:\/\/[^\/]+)/i.exec(base);
-  const origin = m ? m[1] : '';
-  if (!origin) return target;
-  if (target.indexOf('/') === 0) return origin + target;
-  return base.replace(/[^\/]*$/, '') + target;
+  return new URL(target, base).href;
 }
 
 // 响应体解码。id 系统页面是 gb2312/GBK,JSON 接口是 UTF-8,而学校端点并不总是
@@ -234,6 +264,37 @@ function isCampusHost(url) {
   try { return REDIRECT_HOST_ALLOW.test(new URL(String(url || '')).hostname); }
   catch (e) { return false; }
 }
+// 展示用脱敏:剥掉查询串里的票据类参数值(ticket/_csrf/oauth_token),其余
+// 原样保留(非敏感参数照旧可见,便于排障)。
+// 只用于错误消息与日志——**不可用于将要发出的请求**:认证链的重定向本来就靠
+// ticket 串联,改了值就断链。不能用"截断整条 URL"代替:那样既丢掉排障需要的
+// 路径,又只是把秘密挪到看不见的位置(票据仍在内存与日志行长度里)
+function redactUrl(text) {
+  // 值有"带引号"与"裸值"两种形态,都要整体替换:
+  //   ?ticket="SEC"  → ?ticket=***   (整体,含引号)
+  //   ?ticket=SEC&x  → ?ticket=***&x (裸值吃到 & 前)
+  // 裸值字符类不含空白与引号/尖括号——这样同一函数既能用在 URL 上,也能用在
+  // HTML 片段上(如响应体里的 location.replace("/x?ticket=…")):若不排除引号,
+  // 匹配会贪婪吞掉引号与后续闭合标签。反过来,若只排除引号而不单独处理"带引号
+  // 的值",引号后的内容会继续泄漏(?ticket="SEC" 只脱掉引号前的部分)——
+  // 2026-09-21 审阅指出。用在纯 URL 上三者与原行为等价(已逐例对照)
+  // 分隔符要同时认 ?、& 与 HTML 转义的 &amp; —— 响应体是 HTML 时,其中的 URL
+  // 通常把 & 写成 &amp; ,只认裸 & 会让第二个及以后的敏感参数完全不脱敏
+  // (2026-09-22 审阅指出,实测:?ticket=PUBLIC&amp;_csrf=SECRET 的 _csrf 原样
+  // 留在消息里)。捕获组带上分隔符本身,替换时原样保留
+  // 值的引号还要认 HTML 实体形态(&quot;/&#34;/&#39;/&apos;):HTML 属性值里带引号时,
+  // 规范写法就是把引号转义成实体。只认裸引号时 <a href="…?ticket=&quot;SEC&quot;">
+  // 会脱掉 = 前的部分、把实体包裹的值整段留下(2026-09-24 实测各实体均泄漏)。
+  // 实体分支的值类**不排空白**(只排 & < > 与换行):值由成对实体引号闭合,
+  // 内含空格不会贪婪外溢;而排除空白会让"值里带空格"的形态重新泄漏
+  // ——LOGIN_FAILED 先做 \s+→' ' 归一化再脱敏,属性值里的换行恰好变成空格,
+  // 那条路径实测可达(2026-09-24)。裸值分支仍排除空白:它没有闭合标记兜底,
+  // 放宽会吞掉后续结构
+  return String(text || '').replace(
+    /([?&](?:amp;)?)(ticket|_csrf|oauth_token)=("[^"]*"|'[^']*'|&(?:quot|#0*34|#[xX]0*22);[^&<>\n]*&(?:quot|#0*34|#[xX]0*22);|&(?:apos|#0*39|#[xX]0*27);[^&<>\n]*&(?:apos|#0*39|#[xX]0*27);|[^&#\s"'<>]*)/gi,
+    '$1$2=***',
+  );
+}
 // 认证链响应体上限:超时限制的是时间不是字节,异常/被攻陷的校内端点可以在
 // 超时前倾倒巨量内容把 watch 进程内存打爆。登录页/JSON 应答均在数十 KB 量级,
 // 5MB 上限余量充分;超限直接放弃(与代理侧 readLimited 同一哲学)
@@ -261,7 +322,7 @@ async function requestWithRedirects(options, jar, maxRedirects = 16) {
   let method = options.method || 'GET';
   let data = options.data;
   for (let hops = 0; ; hops++) {
-    if (!isAllowedRedirect(url)) throw new Error(`认证请求目标非清华 HTTPS 域,已中止: ${url}`);
+    if (!isAllowedRedirect(url)) throw new Error(`认证请求目标非清华 HTTPS 域,已中止: ${redactUrl(url)}`);
     const cookieHeader = jar.headerFor(url);
     const headers = {
       'User-Agent': USER_AGENT,
@@ -310,8 +371,8 @@ async function requestWithRedirects(options, jar, maxRedirects = 16) {
       const next = resolveUrl(url, redirect);
       if (!isAllowedRedirect(next)) {
         // 首跳目标(即请求发起的域)必然合法;此处拒绝的是链中被带偏的后续跳
-        if (hops === 0) throw new Error(`重定向目标非清华域: ${next}`);
-        throw new Error(`登录链重定向被引向校外地址,已中止(可能被篡改): ${next}`);
+        if (hops === 0) throw new Error(`重定向目标非清华域: ${redactUrl(next)}`);
+        throw new Error(`登录链重定向被引向校外地址,已中止(可能被篡改): ${redactUrl(next)}`);
       }
       url = next;
       // 307/308 按语义保留 method 与 body;301/302/303 转 GET 并丢 body
@@ -320,6 +381,10 @@ async function requestWithRedirects(options, jar, maxRedirects = 16) {
         method = 'GET';
         data = null;
       }
+      // 丢弃这一跳的响应体:重定向响应不需要读,但不 cancel 会让连接挂到 GC
+      // 才释放——登录链一跳一次,watch 长跑下会累积占用连接池
+      // (2026-09-22 审阅指出)
+      try { await res.body?.cancel(); } catch (e) { /* 已结束/无 body */ }
       continue;
     }
     const buf = await readBodyLimited(res);
@@ -355,29 +420,51 @@ class MadmodelAuthClient {
   }
 
   // ID 登录表单提交:SM2 加密密码 → POST /check → 成功页锚点。
-  // formVariant 'thuinfo':action 一律用 checkUrl(表单由 id 域提供)。
+  // 两个调用点(WebVPN OAuth 与 info 门户)表单都由 id 域提供,action 一律用
+  // checkUrl;此处不再区分表单变体(此前的 formVariant 分支两处调用都传
+  // 'thuinfo',是死代码,已删)
   async authenticateIdentity(formUrl, checkUrl, username, password, fingerPrint,
-    twoFactorHandler, existingFormPage, formVariant) {
+    twoFactorHandler, existingFormPage) {
     const formPage = existingFormPage ||
       await requestWithRedirects({ url: formUrl }, this.jar);
     const formBody = String(formPage.body || '');
-    const pubKeyMatch = /id=["']sm2publicKey["'][^>]*>([^<]+)</.exec(formBody) ||
+    // 公钥在登录页上有两种已知形态,各由一条正则覆盖:
+    //   ① JS 变量赋值:  var sm2publicKey = "04…";        (第二条正则)
+    //   ② 标签文本内容: <span id="sm2publicKey">04…</span> (第一条正则)
+    // 注意两条都**不支持** value= 属性形态(<input id="sm2publicKey" value="04…">):
+    // 第一条的 ([^<]+) 抓的是标签闭合 > 之后的文本,拿不到属性值;第二条要求
+    // sm2publicKey 后紧跟 : 或 =,而 " 与空格挡住了。学校若改用该形态会走
+    // NO_PUBLIC_KEY(报"登录页可能已改版")——需要时再加一条属性分支,但仓库
+    // 没有该形态的真实样本,不为未证实形态加路径。
+    //
+    // 抓到什么先不论,统一交给下面的形状校验:不能只判"抓到了非空内容"——
+    // 标签写成 <input id="sm2publicKey">(无内容)时,([^<]+) 会捕获紧随其后的
+    // 换行与缩进(truthy),通过旧守卫后 .trim() 得空串,doEncrypt(password, "")
+    // 抛裸 TypeError("Cannot read properties of null (reading 'multiply')"),
+    // 用户看到的是内部错误而不是"登录页可能已改版"(2026-09-21 实测)
+    const rawMatch = /id=["']sm2publicKey["'][^>]*>([^<]+)</.exec(formBody) ||
       /sm2publicKey['"]?\s*[:=]\s*['"]([0-9a-fA-F]+)['"]/.exec(formBody);
-    if (!pubKeyMatch || !pubKeyMatch[1]) {
+    const candidate = rawMatch ? String(rawMatch[1]).trim() : '';
+    // SEC1 未压缩点:130 个十六进制字符 = 04 前缀 + 64 字节 X/Y。
+    // **必须要求 04 前缀**:sm2.doEncrypt 需要未压缩点格式,喂无前缀的 128 位
+    // 会抛裸 TypeError("Cannot read properties of null (reading 'multiply')")。
+    // 先前写成"可选 04 前缀"是凭猜测放宽(注释还写着"学校也可能给不带 04 的
+    // 形态"),无任何证据,反而给同一个 TypeError 开了第二个入口——校验必须与
+    // 库的实际要求一致(2026-09-22 审阅指出,实测复现)。压缩形态(66 字符)
+    // 同样拒绝:需先解压才能加密,不在本函数职责内
+    if (!/^04[0-9a-fA-F]{128}$/.test(candidate)) {
       throw AuthError('无法获取登录公钥,学校登录页可能已改版', 'NO_PUBLIC_KEY');
     }
 
     const formData = {
       i_user: username,
-      i_pass: `04${sm2.doEncrypt(password, pubKeyMatch[1].trim())}`,
+      // 04 前缀是 SEC1 未压缩点的标记字节,学校服务端据此解点;去掉则密码
+      // 解密失败(现象是"密码不正确",看不出真正原因)
+      i_pass: `04${sm2.doEncrypt(password, candidate)}`,
       fingerPrint: fingerPrint || '',
       fingerGenPrint: '',
       i_captcha: '',
     };
-    if (formVariant !== 'thuinfo') {
-      formData.singleLogin = 'on';
-      formData.fingerGenPrint3 = '';
-    }
     const submitUrl = checkUrl;
 
     const checkRes = await requestWithRedirects({
@@ -408,8 +495,9 @@ class MadmodelAuthClient {
         if (typeof twoFactorHandler !== 'function') {
           throw AuthError('学校要求二次认证(新设备验证),需要人工介入', 'TWO_FACTOR_REQUIRED');
         }
-        body = await this.completeTwoFactor(fingerPrint, twoFactorHandler, approaches);
-        redirectUrl = isSuccessfulBody(body) ? firstAnchorUrl(body, `${ID_PREFIX}/`) : '';
+        const tf = await this.completeTwoFactor(fingerPrint, twoFactorHandler, approaches);
+        body = tf.body;
+        redirectUrl = isSuccessfulBody(body) ? firstAnchorUrl(body, tf.baseUrl) : '';
       }
     }
 
@@ -417,8 +505,12 @@ class MadmodelAuthClient {
       if (body.includes('出错了')) {
         throw AuthError('学校服务处理出错,请稍后重试', 'SERVER_ERROR');
       }
+      // 响应体也要脱敏:学校把成功页改成 JS 跳转(1.9.1 记过的 2026-09-16
+      // 那类改版)时取不到锚点,会落到这里,而带票的 body 前 80 字符会沿
+      // message 进 watch 常驻控制台——脱敏不能只管 URL 那几个 throw 点
       throw AuthError(`登录失败(HTTP ${checkRes.statusCode},响应 ` +
-        `${String(body || '').slice(0, 80).replace(/\s+/g, ' ')}…)`, 'LOGIN_FAILED');
+        `${redactUrl(String(body || '').replace(/\s+/g, ' ')).slice(0, 80)}…)`,
+        'LOGIN_FAILED');
     }
     return { body, redirectUrl, anchorBase };
   }
@@ -429,6 +521,11 @@ class MadmodelAuthClient {
     }, this.jar);
     let json;
     try { json = JSON.parse(res.body || '{}'); } catch (e) {
+      throw AuthError(`${fallbackMessage}:学校返回了无法识别的数据`, 'TWO_FACTOR_INVALID_RESPONSE');
+    }
+    // 'null'/'true'/'123' 都是合法 JSON 但解析出来不是对象,下一行取属性会抛
+    // 裸 TypeError,用户看到内部错误而不是这条明确文案(2026-09-22 实测)
+    if (!json || typeof json !== 'object') {
       throw AuthError(`${fallbackMessage}:学校返回了无法识别的数据`, 'TWO_FACTOR_INVALID_RESPONSE');
     }
     if (res.statusCode !== 200 || json.result !== 'success') {
@@ -454,7 +551,7 @@ class MadmodelAuthClient {
       throw AuthError('学校要求二次认证,但账号未配置可用验证方式', 'TWO_FACTOR_NO_METHOD');
     }
     // 手机号先本地打码再交给 handler:上游未打码时避免全号进日志/终端回显
-    const maskPhone = p => String(p || '').replace(/^(\d{3})\d{4}(\d{4})$/, '$1****$2') || String(p || '');
+    const maskPhone = p => String(p || '').replace(/^(\d{3})\d{4}(\d{4})$/, '$1****$2');
     const selection = await handler({ stage: 'method', methods, phone: maskPhone(info.phone) });
     if (!selection) throw AuthError('已取消学校身份验证', 'TWO_FACTOR_CANCELLED');
     const method = typeof selection === 'string' ? selection : selection.method;
@@ -467,6 +564,8 @@ class MadmodelAuthClient {
     if (!/^\d{6}$/.test(code)) {
       throw AuthError(code ? '学校验证码应为六位数字' : '已取消学校身份验证', 'TWO_FACTOR_CANCELLED');
     }
+    // VERITY 是上游把 VERIFY 拼错了,原样照抄,勿"顺手修正"成 VERIFY_CODE
+    // (改了现象是"验证码永远校验失败",极难归因)
     const verified = await this.requestAuthAction(
       { action: method === 'totp' ? 'VERITY_TOTP_CODE' : 'VERITY_CODE', vericode: code },
       '学校验证码校验失败');
@@ -474,10 +573,19 @@ class MadmodelAuthClient {
       try {
         const saved = await requestWithRedirects({
           url: ID_SAVE_FINGER(), method: 'POST',
+          // deviceName 会出现在学校统一认证的"可信设备"列表里,是对外可见的
+          // 名称;这个串是 1.6.x 去 dsh 品牌前的遗留(项目早期名),改动前先
+          // 想清楚老设备条目
           data: { fingerprint: fingerPrint, deviceName: 'dsh-madmodel', radioVal: '是' },
         }, this.jar);
         const savedJson = JSON.parse(saved.body || '{}');
-        if (savedJson.result !== 'success') console.warn('学校未能登记可信设备:', savedJson.msg);
+        // 同上:非对象时取 .result 会抛,而这里在 try 内,会被下面的 catch 报成
+        // "可信设备登记失败",归因不准;显式判一下
+        if (!savedJson || typeof savedJson !== 'object') {
+          console.warn('学校未能登记可信设备:返回了无法识别的数据');
+        } else if (savedJson.result !== 'success') {
+          console.warn('学校未能登记可信设备:', savedJson.msg);
+        }
       } catch (e) {
         console.warn('可信设备登记失败,本次继续登录:', e.message);
       }
@@ -489,13 +597,19 @@ class MadmodelAuthClient {
     const completed = await requestWithRedirects({
       url: resolveUrl(`${ID_PREFIX}/`, redirectUrl),
     }, this.jar);
-    return completed.body;
+    // 连 base 一起返回:调用方要拿成功页里的锚点,而锚点可能是相对路径,
+    // 必须按**这一跳实际落地的 URL** 解析。此前调用方用固定的 id 域根作 base,
+    // 锚点相对更深路径时会解析到错地址(2026-09-22 审阅指出)
+    return { body: completed.body, baseUrl: completed.finalUrl || `${ID_PREFIX}/` };
   }
 
   // ===== WebVPN 会话 =====
 
   async attemptWebVpnLoginOnce(username, password, fingerPrint, twoFactorHandler) {
     this.jar.clearOrigins([ID_PREFIX, WEBVPN_PREFIX]);
+    // 连发两次同一请求是刻意的,不是复制粘贴:第一跳只为走完 OAuth 的首次
+    // 落 cookie/跳转建立表单会话,其响应内容弃用(第二跳才是判据);删掉第一行
+    // 会让"首次启动"路径上 oauthNeedsLogin 判据拿到未建立的会话
     await requestWithRedirects({ url: WEBVPN_OAUTH_LOGIN() }, this.jar);
     const oauth = await requestWithRedirects({ url: WEBVPN_OAUTH_LOGIN() }, this.jar);
     const oauthNeedsLogin = /^https:\/\/id\.tsinghua\.edu\.cn\//i.test(oauth.finalUrl || '') ||
@@ -515,7 +629,7 @@ class MadmodelAuthClient {
       const direct = await this.authenticateIdentity(
         oauth.finalUrl || WEBVPN_OAUTH_LOGIN(),
         ID_LOGIN_CHECK(), username, password, fingerPrint, twoFactorHandler,
-        oauth, 'thuinfo');
+        oauth);
       if (!isCampusHost(direct.redirectUrl)) {
         throw AuthError('WebVPN OAuth 返回了未允许的跳转地址', 'WEBVPN_OAUTH_REDIRECT');
       }
@@ -540,9 +654,13 @@ class MadmodelAuthClient {
   // 上游请求同一条路径——判定即真实业务可用性):3xx = 会话无效,2xx/4xx/5xx
   // = 穿过隧道到达应用即有效。网络错误保守判无效(与旧版 catch 行为一致)
   async verifyWebVpnSession() {
+    // 按**隧道前缀**取 cookie,不是根路径:隧道会话 cookie 可能设在深路径
+    // (Path=/https/<hash>)上,用根路径匹配会漏掉它,把有效会话误判成无效
+    // (watch 续期据此卡死);按隧道前缀匹配同时也排除了 info 门户等**同域其他
+    // 应用**的 cookie,避免把不相关的会话随请求带出去(2026-09-22)
     const verdict = await probeWebvpnSession(
       MADMODEL_TUNNEL_MODELS_URL,
-      this.jar.headerFor(WEBVPN_PREFIX + '/'));
+      this.jar.headerFor(TUNNEL_COOKIE_SCOPE));
     return verdict === 'ok';
   }
 
@@ -571,15 +689,14 @@ class MadmodelAuthClient {
     }
     const identity = await this.authenticateIdentity(
       formUrl, ID_LOGIN_CHECK(), username, password, fingerPrint, twoFactorHandler,
-      formPage, 'thuinfo');
+      formPage);
     if (!identity.redirectUrl) {
       throw AuthError('info 门户漫游未返回跳转地址', 'WEBVPN_INFO_ROAM_EMPTY');
     }
     const targetUrl = this.toLbRedirectUrl(identity.redirectUrl);
-    // 打日志前显式剥掉 ticket/_csrf 等敏感查询参数(不能靠截断长度来"碰巧"截掉)
-    console.warn('[WebVPN] info 漫游跟随', String(targetUrl)
-      .replace(/([?&])(ticket|_csrf|oauth_token)=[^&]*/gi, '$1$2=***')
-      .slice(0, 120));
+    // 打日志前剥掉 ticket/_csrf 等敏感查询参数(redactUrl——错误消息与日志
+    // 同一规则,不能靠截断长度来"碰巧"截掉)
+    console.warn('[WebVPN] info 漫游跟随', redactUrl(targetUrl).slice(0, 120));
     try {
       await requestWithRedirects({ url: targetUrl }, this.jar);
     } catch (e) {
@@ -648,14 +765,18 @@ class MadmodelAuthClient {
   // ===== madmodel token =====
 
   // 漫游 JSON 的 roamingurl 可能带 WebVPN 前缀(https://webvpn.../https/HASH/...)
-  // 也可能直指原站;统一剥出 ticket 所在的目标 URL。
+  // 也可能直指原站。两种形态一律原样返回:ticket 取自在查询串(两种形态都
+  // 带着它),入口请求发的就是这个 URL——前缀形态本就是本文件在用的隧道地址
+  // 形态(见 INFO_PREFIX / MADMODEL_VPN_PREFIX),无需还原成原站主机名。
+  //
+  // 此前这里按 hex 解码 HASH,是错的:HASH = hex(IV) + hex(AES-128-CFB(主机名)),
+  // 密钥与 IV 同为 ASCII 口令 "wrdvpnisthebest!",所以每串都以
+  // 77726476706e69737468656265737421 开头——那正是口令本身的十六进制。按
+  // UTF-8 读只能得出口令 + 密文乱码,还会连 path 与 ?ticket=... 一起丢掉
+  // (门户实测不返回该形态,该分支从未执行)。编码方案与再生成命令可执行,
+  // 见 test/tunnel-prefix.test.js
   mapRoamingUrl(url) {
-    let value = decodeHTML(String(url || '')).replace(/&amp;/g, '&');
-    const vpnPrefix = /^https:\/\/webvpn\.tsinghua\.edu\.cn\/https\/([0-9a-f]+)\//i.exec(value);
-    if (vpnPrefix) {
-      value = `https://${Buffer.from(vpnPrefix[1], 'hex').toString('utf8')}`;
-    }
-    return value;
+    return decodeHTML(String(url || '')).replace(/&amp;/g, '&');
   }
 
   async resolveRoamingTarget(payload, label, credentials) {
@@ -734,7 +855,10 @@ class MadmodelAuthClient {
       // WebVPN 隧道会话 cookie:上游走 WebVPN 前缀时必须随请求回传(不带会被
       // 隧道踢回登录页)。认证链结束时 jar 里 webvpn 域的 cookie 即所需全集,
       // 与 token 同生命周期(每次续期整链重跑,cookie 随之更新)。
-      cookie: this.jar.headerFor(WEBVPN_PREFIX + '/'),
+      // 按**隧道前缀**取:上游打在隧道的深路径上,cookie 可能设在
+      // Path=/https/<hash> 这种深路径,用根路径匹配会漏掉它;按隧道前缀匹配
+      // 同时排除同域其他应用(如 info 门户)的 cookie——上游只该拿到隧道的
+      cookie: this.jar.headerFor(TUNNEL_COOKIE_SCOPE),
     };
   }
 }
@@ -793,6 +917,9 @@ module.exports = {
   // cookie 回传——单一来源,防止复制串漂移导致"上游是隧道但保活/cookie 判定
   // 失效"的静默错位
   MADMODEL_VPN_PREFIX,
+  TUNNEL_COOKIE_SCOPE,
+  // info 门户的隧道前缀:HASH 的编码方案与再生成命令见 test/tunnel-prefix.test.js
+  INFO_PREFIX,
   // 隧道内 models 探测地址(登录期会话判定与保活共用,见常量定义处注释)
   MADMODEL_TUNNEL_MODELS_URL,
   // 以下为认证链中出错概率最高的纯判定函数(响应体解码/URL 解析/重定向白名单)。
@@ -800,5 +927,7 @@ module.exports = {
   decodeBody,
   resolveUrl,
   isAllowedRedirect,
+  // 展示用脱敏(纯函数,测试钉住三类参数的大小写不敏感匹配与"其余参数保留")
+  redactUrl,
 };
 

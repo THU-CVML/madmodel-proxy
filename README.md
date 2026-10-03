@@ -1,140 +1,190 @@
 # madmodel-proxy
 
-把清华的 DeepSeek 服务（[madmodel.cs.tsinghua.edu.cn](https://madmodel.cs.tsinghua.edu.cn/)）变成本地 OpenAI 端点。token 过期自动续期，上游接口的兼容性问题在代理层处理，客户端只需连 `http://127.0.0.1:8080/v1`。
+将清华大学 Deepseek 服务（[https://madmodel.cs.tsinghua.edu.cn/](https://madmodel.cs.tsinghua.edu.cn/)）接入支持 OpenAI Chat Completions 的本机客户端，并自动续期登录凭据。需要清华大学统一认证账号。
 
-2026-09-10 起直连域名被校园网 oauth 门禁接管，上游默认走 **WebVPN 隧道**（校内、校外网络都能访问）；首次启动会问一次你的网络环境，校园网内可改走直连换取更快的路径，见[校内 / 校外](#校内--校外)。
+支持 Windows、macOS 和 Linux。推荐 [Node.js 24 LTS](https://nodejs.org/)，最低版本为 18.14；无需 `npm install`。
 
-## 使用
+## 快速开始
 
-前置是 Windows、macOS 或 Linux，Node.js ≥ 18.14，以及一个清华统一认证账号。
+安装 Node.js 后，在终端依次执行以下命令。
 
 ```sh
 git clone https://github.com/noroadback/madmodel-proxy.git
 cd madmodel-proxy
-
-# 首次配置:输入学号+密码(首次登录需二次认证)
-node refresh-token.js login
+npm run login
+npm start
 ```
 
-凭据静态加密存于 `%USERPROFILE%\.madmodel-proxy\`（macOS / Linux 为 `~/.madmodel-proxy/`），加密形态与数据流向见 [SECURITY.md](SECURITY.md)。不再使用时清除本机凭据：关闭 start.cmd 后运行 `node refresh-token.js logout`（清除密码、token 与隧道会话；学校侧登录状态不受影响）。
+没有 Git 时，在仓库页面选择 **Code → Download ZIP**，解压后在项目目录打开终端，从 `npm run login` 开始执行。
 
-Windows 双击 **start.cmd** 启动（首次会问两件事：是否创建桌面快捷方式、以及你的网络环境是校园网还是校外——选择会记住，之后不再询问；代理已在运行时再次运行会显示状态，不会重复启动），macOS / Linux 运行 `npm start`（首次在终端里同样会问一次网络环境，非交互环境自动按隧道）。窗口保持开启。启动成功的标志是下面这样的输出：
+按提示输入学号、统一认证密码，必要时完成二次认证。登录成功后，日常只需 `npm start`。Windows 也可双击 **start.cmd**，或双击 `create-shortcut.cmd` 创建桌面快捷方式。
 
+首次启动会询问网络方式，并记住选择。校园网内可选直连，校外或不确定时选 WebVPN 隧道。启动后会看到类似输出。
+
+```text
+[watch] 自动续期已启动
+[代理] 服务已启动 http://127.0.0.1:8080/v1
 ```
-[watch] madmodel token 自动续期守护进程已启动(PID 12345)
-[代理] madmodel 本地端点已启动: http://127.0.0.1:8080/v1
-[代理] 当前 token 剩余 272 分钟
-```
 
-在客户端（智能体、OpenAI SDK）里填以下值。
+在客户端填写以下配置。
 
 | 配置项 | 值 |
 |---|---|
-| 协议 | Chat Completions |
+| API 类型 | OpenAI Chat Completions |
 | Base URL | `http://127.0.0.1:8080/v1` |
-| API Key | 任意值（本地无鉴权） |
-| 模型 | `DeepSeek-V4-Flash-0731` |
+| API key | 任意非空值，例如 `local` |
+| 模型 | 获取列表后选择；不支持获取列表时，复制下表中的模型 ID |
 
-客户端要求填写上下文长度时填 `262144`（学校部署的实际值）。不要按官方 DeepSeek 规格配置——部分客户端会自动匹配到官方的 1M 上下文，长会话会越过上限。输出上限（max_tokens）按客户端默认即可：`prompt + max_tokens` 超出 262,144 时代理自动把输出预算收缩到剩余空间再发，仅极长输出需要续写。
+客户端需支持自定义 Base URL 和 Chat Completions。代理按所选模型转发请求；仅支持 Responses 接口的配置无法直接接入。
 
-## 为什么需要它
+### 模型配置
 
-madmodel 本身有 OpenAI 格式的 API，但直接连客户端会撞上两件事。此外，2026-09-10 起直连域名 `madmodel.cs.tsinghua.edu.cn` 还被校园网新版 TsinghuaLB 的 oauth 门禁接管：未带 LB 凭证的请求被 307 到统一认证并丢失请求体，无法直接使用；因此上游统一走 **WebVPN 隧道**（不受门禁影响，校内外网络都可达），见[校内 / 校外](#校内--校外)。
+无法获取模型列表时，在客户端选择“自定义模型”或手填 Model ID，完整复制以下名称。
 
-**token 有效期短**。key 只有 5 小时有效期，只能网页登录后手动复制，重度使用一天要重复数次。本工具用统一认证链自动续期，到期前 30 分钟换新，代理热加载。
+| 模型 ID | 实测可用输入 |
+|---|---|
+| `DeepSeek-V4.1-Flash` | 文字、图片 |
+| `qwen3.8-27b` | 文字、图片、视频 |
+| `DeepSeek-R1-W8A8` | 文字 |
 
-**接口行为与客户端预期不符**。学校网关对上游读空闲有 60 秒硬超时（2026-09-16 实测：直连与隧道两条路径都有这堵墙，非流式请求 60.1 秒收到 504 错误页）；错误都以 `HTTP 200` 返回"服务器繁忙"；`/v1/models` 返回网页 HTML。本工具在代理层逐项适配：对上游恒以流式请求、客户端要非流式就聚合——强制流式只缓解部分场景，流式下首帧等待与流中静默同样会撞 60 秒墙，截断时错误信息给出真因与处置；错误翻译回真实状态码。
+以上为 2026-09-30 经本代理的实测结果。
 
-### 校内 / 校外
+客户端需支持发送对应媒体。若需手动开启“图片输入”或“视觉”，可按上表设置；`supports_vision` 标记可能与实测不符。代理不提供独立的图像生成或语音接口。
 
-上游有两条路径，**首次启动时会问你一句「网络环境是校园网还是校外」**，据此自动选择：
+学校可能调整模型名称和能力。代理会在凭据有效后自动探测；可打开 [本机模型列表](http://127.0.0.1:8080/v1/models) 复制其中的 `id`，改过端口时同步替换地址。
 
-- **校园网内** → 直连 `madmodel.cs.tsinghua.edu.cn`，更快、少一跳（仅校园网内可用）
-- **校外或不确定** → 走 WebVPN 隧道，任何网络都能用（默认，也是无输入/超时时的兜底）
+- **思考**。支持开关的模型默认开启，可用 `reasoning_effort: "none"` 关闭。
+- **工具调用**。必要时尝试恢复，最多额外请求一次；禁用工具时不补救。带工具的流式回复可能先显示思考，正文等生成结束后再显示。
+- **Qwen 乱码**。已加入缓解措施，可能增加首字等待时间，见 [1.10.1 更新记录](CHANGELOG.md#1101)。
 
-选择记在状态目录的 `network-choice.json`，之后启动不再询问。**换了网络环境随时在运行窗口里切换**——在窗口中输入后回车：
+<details>
+<summary>上下文与输出预算（按需填写）</summary>
 
-```
-campus       # 切到校园网直连
-offcampus    # 切回 WebVPN 隧道
-```
+以下是当前代理配置，单位为 token。
 
-切换当场生效（端点与续期守护按新场景重启几秒，在途请求会中断，客户端重试即恢复；token 与登录状态在文件里，不丢）。选择同时记住，下次启动沿用。也可以用命令行切换，适合代理没在跑的时候：
+| 模型 | 上下文上限 | 最大输出预算 |
+|---|---:|---:|
+| `DeepSeek-V4.1-Flash` | 1,048,576 | 1,048,576 |
+| `qwen3.8-27b` | 262,144 | 262,000 |
+| `DeepSeek-R1-W8A8` | 131,072 | 65,536 |
 
-```sh
-# Windows
-start.cmd campus      # 改成校园网直连
-start.cmd offcampus   # 改回隧道
-```
+输入与输出共享上下文，代理会下调超出剩余空间的输出预算。表中数值不保证单次生成长度；R1 使用保守回退值，实际窗口未验证。
 
-命令行切换立即记住、下次启动生效——代理在跑时带参数运行 `start.cmd`，会显示状态并提示；最顺的路径是直接在运行窗口里输 `campus` / `offcampus`。想重新被问一遍，删掉状态目录里的 `network-choice.json` 即可。
+</details>
 
-macOS / Linux 没有 start.cmd，用 `node network-choice.js plan campus` / `node network-choice.js plan offcampus` 切换（重启生效），或用下面的 `PROXY_UPSTREAM` 形式指定，或删掉状态目录里的 `network-choice.json` 让下次启动重新问。
+## 日常使用
 
-**高级用法**：`PROXY_UPSTREAM` 环境变量**优先级最高**——设了它就不问、也不被覆盖，直接按你给的端点走（此时隧道会话保活自动关闭：直连无会话 cookie 可探，且直连被门禁挡时的 3xx 会被探活误判为失效）。
+保持运行窗口开启，按 Ctrl+C 停止。自动续期成功后无需重启；学校要求重新认证时，再运行一次 `npm run login`。
 
-```sh
-# 手动指定上游（优先于上面的选择）
-PROXY_UPSTREAM=https://madmodel.cs.tsinghua.edu.cn/v1/chat/completions npm start
-```
+以下命令在项目目录的另一个终端中执行。
 
-无论哪种场景，token 都由认证链经 WebVPN 隧道换取、到期自动续期，行为一致。
+| 操作 | 命令 |
+|---|---|
+| 查看运行状态 | `npm run status` |
+| 重新登录或更新密码 | `npm run login` |
+| 手动续期一次 | `npm run once` |
+| 清除本机凭据，先停止服务 | `node refresh-token.js logout` |
 
-## 特性
+日志中的 `token 输入数/输出数` 来自上游，累计值在代理进程重启后归零；未返回的用量不估算。“工具调用”表示已交给客户端的调用数量，执行结果由客户端决定。
 
-- **零依赖**。纯 Node 原生，clone 即用，无 `npm install`
-- **token 自动续期**。到期前 30 分钟自动走登录链换新，热加载免重启。通常无需人工干预；学校要求重新验证（如可信设备失效）时重跑一次 `node refresh-token.js login`
-- **本地分词预检**。内容分词与学校部署在实测样本上逐 token 一致。预检按 `prompt+max_tokens ≤ 262,144` 判定，超限自动收缩输出预算放行（极长输出可能提前截断需续写），剩余不足最低输出预算时 413
-- **静态加密存储**。Windows 用 DPAPI、macOS 用登录钥匙串、Linux 用机器绑定加密
-- **单窗口运行**。Windows 双击 start.cmd、macOS / Linux 用 `npm start`，同窗拉起守护与代理，Ctrl+C 或关窗全停
+凭据默认保存在 `~/.madmodel-proxy/`，与项目目录分开。`logout` 清除本机凭据，不撤销学校侧的会话。服务仅监听 `127.0.0.1`，不校验本地 API key；能访问该端口的程序及同机其他用户均可调用。存储方式与数据流向见 [安全说明](SECURITY.md)。
 
-## 边界
+### 校内 / 校外切换
 
-- **本地无鉴权**。只监听 `127.0.0.1` + Host 白名单，客户端 API key 填任意值
-- **只有 chat completions**。无 embeddings、图像、音频；会话历史含图片（`image_url` 等内容段）的请求在本地直接 400——上游不支持视觉输入，收到会立即拒绝（见[常见问题](#常见问题)）；单模型，任意模型名都会被重写为 `DeepSeek-V4-Flash-0731`；`logprobs`/`n>1` 被剥离（上游拒绝）；`max_tokens` 收敛到 [512, 65536]（下限仅思考开启时生效）
+在运行窗口输入 `campus` 切到校园网直连，输入 `offcampus` 切到校外 WebVPN 隧道，回车生效。
+
+切换会重启服务并保存选择，未完成的请求需重试。离开校园网后请求失败，可先切到 `offcampus`；网络可达性仍取决于学校当前策略。
+
+Windows 也可运行 `.\start.cmd campus` / `.\start.cmd offcampus`。服务已运行时，这两个命令只保存选择，下次启动生效。设置了 `PROXY_UPSTREAM` 时，启动以该变量为准。
 
 ## 常见问题
 
-| 现象 | 处理 |
+| 现象 | 处理方式 |
 |---|---|
-| 请求 401 `token 已过期` | watch 守护没在跑或续期失败。`node refresh-token.js status` 一屏看清；没跑就开 start.cmd 或 `npm start` |
-| 请求 503 | 本地无 token。没做过 login，或 `[watch]` 日志有报错 |
-| 请求 413 上下文超限 | 会话接近 262,144 tokens 上限（`max_tokens` 已被代理自动收缩过仍不够）。新开会话，或让客户端压缩 history |
-| 启动报 `端口 8080 已被占用` | 代理已在运行，直接使用；需另开实例时用 `PROXY_PORT` |
-| 换了网络环境后全部请求失败 | 直连只在校园网内可用。在**运行窗口里输 `offcampus` 回车当场切回**；代理没在跑时运行 `start.cmd offcampus`（或删掉状态目录的 `network-choice.json`，下次启动会重新问） |
-| 请求 400 会话历史含图片 | 历史里有 `image_url` 内容段（Codex 等客户端的 view_image 一类工具会把图片输出写进历史，此后每轮请求都带着它）。上游不支持视觉输入，收到会立即拒绝并伪装成"服务器繁忙"，重试无效。新开会话，或移除该消息后重试 |
-| 请求 502/429 | 按错误信息区分：含"繁忙"是上游过载，稍后重试；含"截断"是上游拥塞期撞了学校网关的 60 秒读空闲超时，等待后重试，持续出现按错误信息中的等待秒数减小会话上下文；含"会话失效"几秒后重试（自动重签中）；含"上下文超限"按 413 行处理；其他持续出现提 issue 附代理日志 |
-| 闲置过久后请求异常 | 隧道会话空闲过期（cookie 闲置约 2 小时失效）。watch 守护每 `PROXY_KEEPALIVE_MS`（默认 25 分钟）保活隧道、会话失效自动重签 token+cookie，通常无需干预 |
-| 改密码后窗口大量报错并停止续期 | 正常保护行为。重新 `node refresh-token.js login`，登录后自动恢复 |
-| 切换网络后第一句响应很慢 | 会话失效正在自动重签（数秒内完成并自动重试），无需操作 |
-| token 长期无人续期 | 改过密码或二次认证过期，重跑一次 `node refresh-token.js login` |
-| 仓库文件夹丢失 | 重新 clone 即可，登录状态不丢：状态目录（`~/.madmodel-proxy/`）与仓库分离 |
+| 连接被拒绝 | 运行 `npm run status`，确认代理已启动，客户端端口一致 |
+| 端口已被占用 | 确认是否已有代理运行；需要换端口时设置 `PROXY_PORT`，并同步修改客户端地址 |
+| 换网络后请求失败 | 在原运行窗口输入 `offcampus` 并回车，切换后重试 |
+| 401 或 token 过期 | 确认 watch 在运行，等待自动续期；持续失败时运行 `npm run login` |
+| 尚未登录、改密码或需二次认证 | 在另一个终端运行 `npm run login`，按提示完成认证 |
+| 模型不存在 | 重启代理后重新获取模型列表，更新客户端选择 |
+| 客户端不能获取模型列表 | 手填上表的模型 ID，或在浏览器打开本机 `/v1/models` 查询 |
+| 无法添加图片 | 检查客户端的图片输入开关；若客户端支持手动设置视觉能力，可按前面的能力表启用 |
+| “服务器繁忙”或 429 | 降低并发，稍后重试；持续失败时用短对话和默认参数验证，也可能是参数不兼容或请求超限 |
+| 413 | 减少图片或缩短对话。本地请求体上限为 16 MiB，上游可能更低；具体原因见报错 |
+| 502、504 或回复中断 | 尝试缩短对话或切换网络；流式也可能因上游长时间无数据而中断 |
+| 思考正常但工具没执行 | 确认客户端提供工具且未禁用；若日志已有“工具调用”，检查客户端是否等待执行确认 |
 
-## 环境变量
+## 更新
 
-| 变量 | 默认 | 说明 |
+先停止服务，提交或备份自己修改的项目文件，再执行 `git pull` 并重新启动。升级后在客户端重新获取模型列表。
+
+ZIP 用户请解压新版到新目录，使用桌面快捷方式时重新创建。默认凭据与项目目录分开，同一系统账户下通常可继续使用；自定义状态目录需继续使用原路径。版本检查只提示，不会自动更新文件。
+
+## 高级配置
+
+环境变量在启动前设置，修改后重启生效。例如将端口改为 8081，客户端地址也需改为 `http://127.0.0.1:8081/v1`。
+
+```powershell
+# PowerShell
+$env:PROXY_PORT = "8081"
+npm start
+```
+
+```sh
+# macOS / Linux
+PROXY_PORT=8081 npm start
+```
+
+| 变量 | 默认值 | 用途 |
 |---|---|---|
-| `PROXY_UPSTREAM` | 默认 WebVPN 隧道 | 覆盖上游端点，**优先级最高**：设了就跳过首次的网络询问、也不会被它覆盖（高级用法）。校内直连用 `madmodel.cs.tsinghua.edu.cn/v1/chat/completions`；测试可指向本地假上游；否则保持默认，由首次询问决定 |
-| `PROXY_PORT` | `8080` | 监听端口 |
-| `PROXY_BIND_HOST` | `127.0.0.1` | 监听地址。默认仅本机；设 `0.0.0.0` 对局域网开放。**非回环监听时必须配 `PROXY_API_KEYS`**（否则 proxy.js 仍会起但任何人可用；随附的 `scripts/service.sh` 会直接拒绝裸奔启动） |
-| `PROXY_API_KEYS` | 空（不鉴权） | 逗号分隔的 API Key。非空即开启鉴权：请求头 `Authorization: Bearer <key>` 或 `x-api-key: <key>`（时间恒定比较，任一命中即放行）。空时沿用「仅回环 + Host 白名单」的原边界。对外监听时强烈建议设置。`GET /healthz` 恒免鉴权（回 `ok`，供探活） |
-| `PROXY_REFRESH_AHEAD_MS` | 1800000 | 提前续期窗口（毫秒） |
-| `PROXY_NO_TOKEN_WAIT_MS` | 60000 | watch 守护未配置凭据时的重查间隔（毫秒） |
-| `PROXY_MAX_SLEEP_MS` | 3600000 | watch 守护单次等待上限（毫秒），到点醒来重读 token 状态 |
-| `PROXY_KEEPALIVE_MS` | 1500000 | 隧道会话保活探活间隔（默认 25 分钟）；只有默认隧道上游时生效
-| `PROXY_IDLE_MS` | 65000 | 流式空闲超时（毫秒）：上游持续无数据即判挂死。默认值在学校网关 60 秒读空闲超时之上留 5 秒余量——网关掐的流以"流被截断"到达并带真因归因，守卫只兜网关掐不动的挂死（TCP 挂死时连截断都没有）；不要设到 60000 以下，否则大上下文的慢预填（实测首帧最长 58 秒）会被误杀 |
-| `PROXY_STREAM_TOTAL_MS` | 1200000 | 单次流式请求总时限（毫秒） |
-| `PROXY_NONSTREAM_TOTAL_MS` | 600000 | 非流式请求聚合总时限（毫秒） |
-| `DUMP_FAILED` | 关 | `=1` 时被上游拒绝的请求体落盘，含完整对话（隐私），排障后删 |
+| `PROXY_PORT` | `8080` | 本地端口 |
+| `PROXY_UPSTREAM` | 按网络选择 | 完整上游 Chat Completions URL，启动时优先于网络选择。对话和 Bearer token 会发送到此地址，仅配置可信服务 |
+| `PROXY_BIND_HOST` | `127.0.0.1` | 监听地址。默认仅本机；设 `0.0.0.0` 对局域网开放。**非回环监听时必须配 `PROXY_API_KEYS`**（随附的 `scripts/service.sh` 会拒绝裸奔启动） |
+| `PROXY_API_KEYS` | 空（不鉴权） | 逗号分隔的 API Key。非空即开启鉴权：请求头 `Authorization: Bearer <key>` 或 `x-api-key: <key>`（时间恒定比较）。空时沿用「仅回环 + Host 白名单」原边界。`GET /healthz` 恒免鉴权 |
+| `PROXY_TOOL_FIX` | `1` | `0` 关闭文本工具调用补救 |
+| `PROXY_NO_UPDATE_CHECK` | 未设置 | `1` 关闭启动时的 GitHub 版本检查 |
+| `MADMODEL_STATE_DIR` | `~/.madmodel-proxy` | 凭据与状态目录 |
+
+运行中输入 `campus` / `offcampus` 会覆盖当前进程的上游地址；下次启动仍以启动终端设置的 `PROXY_UPSTREAM` 为准。
+
+<details>
+<summary>超时、续期与排障参数</summary>
+
+以下时间参数单位均为毫秒。工具补救重发使用独立超时。
+
+| 变量 | 默认值 | 用途 |
+|---|---|---|
+| `PROXY_IDLE_MS` | `65000` | 上游流空闲超时 |
+| `PROXY_STREAM_TOTAL_MS` | `1200000` | 单次上游流总超时 |
+| `PROXY_NONSTREAM_TOTAL_MS` | `600000` | 非流式聚合总超时，工具补救重发另计 |
+| `PROXY_TOOL_RETRY_TIMEOUT_MS` | `120000` | 工具补救重发超时 |
+| `PROXY_RETRY_WAIT_MS` | `30000` | WebVPN 登录重定向后等待新凭据的时间 |
+| `PROXY_REFRESH_AHEAD_MS` | `1800000` | 到期前多久开始续期 |
+| `PROXY_NO_TOKEN_WAIT_MS` | `60000` | 无可用 token 且未配置凭据时的检查间隔 |
+| `PROXY_MAX_SLEEP_MS` | `3600000` | 续期调度单次等待的上限 |
+| `PROXY_KEEPALIVE_MS` | `1500000` | WebVPN 保活间隔，仅隧道模式启用 |
+| `DUMP_FAILED` | 未设置 | `1` 保存部分上游失败请求至状态目录的 `last-failed-request.json`，含完整对话，排障后请关闭并删除文件 |
+
+`PROXY_TOKEN_FILE`、`MADMODEL_FORCE_TUNNEL_MODE` 和 `MADMODEL_KEYCHAIN_SERVICE` 用于开发与隔离测试。可用 `npm run watch` / `node proxy.js` 分别启动续期服务和代理。
+
+</details>
+
+<details>
+<summary>模型列表、参数转换与兼容细节</summary>
+
+- **模型列表**。探测有成功结果时，只返回这些模型；全部失败时，返回未被确认为不存在的候选。`available` 的 `true` / `false` / `null` 分别表示探测成功、失败和尚未探测。`target` 标记参考模型，`config.js` 的 `MODEL` 不参与请求路由。
+- **思考参数**。原生 `chat_template_kwargs` 开关优先于顶层参数。未指定档位时使用能力列表的首档；无法关闭思考的模型仍可设置合法档位。Qwen 的 `reasoning` 转为 `reasoning_content`。
+- **工具补救**。只解析完整的 DSML / Hermes 标记和客户端提供的工具名，拒绝代码围栏、反引号中的调用示例。响应为空或含有工具标记时才可能重发，单纯文字回答不触发重发。Qwen 保留工具定义，将发往上游的 `tool_choice` 调整为 `none` 后尝试文本恢复。
+- **请求预算**。`max_completion_tokens` 转成 `max_tokens`；未明确关闭思考时，低于 512 的输出预算提升到 512。仅保留单个候选回复，删除 `logprobs` / `top_logprobs`。
+- **token 计量**。本地用 DeepSeek 分词器估算，计入历史思考并预留模板余量；图片不计入，Qwen 等模型可能存在误差。日志取上游用量，补救重试时合计两次请求中已返回的数据。
+- **速度日志**。成功请求结束时显示首字等待和均速。首字按代理收到首个思考、正文或工具调用计时；均速为上游输出 token（含思考）除以请求总耗时，包含等待和补救请求。无法测得首字时间或用量不完整时，省略对应指标。
+- **流式与报错**。常规上游请求使用 SSE，非流式客户端由代理聚合。上游截断时不补发 `[DONE]`；开始发送 SSE 后出现错误，只能通过中断流和日志反映。
+- **Qwen 缓存**。为 `qwen3.8-27b` 的每次上游请求生成新的 `cache_salt`，重试也更换，并覆盖客户端固定值。其他模型不受此措施影响。
+
+</details>
 
 ## 更多
 
-- 上游实测行为与设计取舍，见 [CHANGELOG.md](CHANGELOG.md)。
-- 数据流向与安全边界，见 [SECURITY.md](SECURITY.md)。
-- 参与贡献，见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+[更新记录](CHANGELOG.md) · [安全说明](SECURITY.md) · [贡献指南](CONTRIBUTING.md) · [MIT 许可证](LICENSE) · [第三方声明](THIRD-PARTY-NOTICES.md)
 
-本工具仅供清华大学师生在遵守学校相关规定的前提下个人使用，不提供配额共享，请勿用于服务他人的用途。
-
-## 许可证
-
-[MIT](LICENSE)
+本项目为非官方客户端，学校服务或认证流程变化可能影响使用。

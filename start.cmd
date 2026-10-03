@@ -26,7 +26,7 @@ set "MADARG_OK="
 if /i "%~1"=="campus" set "MADARG_OK=1"
 if /i "%~1"=="offcampus" set "MADARG_OK=1"
 if not "%~1"=="" (
-  node "%~dp0network-choice.js" plan %~1 >nul
+  node "%~dp0network-choice.js" plan "%~1" >nul
   rem exit 3 = PROXY_UPSTREAM was set, the argument did NOT persist
   if !errorlevel!==3 set "MADARG_OK="
 )
@@ -46,12 +46,14 @@ if not exist "%USERPROFILE%\.madmodel-proxy\shortcut-created" (
 
 rem If OUR proxy already answers on the port, do not duplicate-start:
 rem show a health summary instead (proxy / token / watch / credentials).
-rem Probes GET /v1/models and looks for a DeepSeek model id (prefix match,
-rem survives upstream model renames): another program merely
-rem listening on the port would be misreported as "already running".
-node -e "fetch('http://127.0.0.1:%MADPORT%/v1/models').then(r=>r.json()).then(j=>{process.exit(j&&Array.isArray(j.data)&&j.data.some(m=>String(m.id).startsWith('DeepSeek'))?0:1)}).catch(()=>process.exit(1))" >nul 2>&1
+rem Probes GET /v1/models and looks for our own owned_by marker: another program
+rem merely listening on the port would be misreported as "already running".
+rem The marker is written by this proxy itself, so it survives upstream model
+rem renames -- a model-name prefix match would not (upstream dropped the
+rem DeepSeek-V4-Flash-0731 name on 2026-09-27 and now also serves qwen3.8-27b).
+node -e "fetch('http://127.0.0.1:%MADPORT%/', {signal:AbortSignal.timeout(2000)}).then(r=>r.json()).then(j=>{process.exit(j&&j.proxy==='madmodel'?0:1)}).catch(()=>process.exit(1))" >nul 2>&1
 if %errorlevel%==0 (
-  echo madmodel proxy is already running on port %MADPORT% - health check:
+  echo madmodel proxy is already running on port %MADPORT% - local status:
   node "%~dp0refresh-token.js" status
   echo.
   echo Nothing started. Close this window; the running dashboard keeps serving.

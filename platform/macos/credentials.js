@@ -149,13 +149,13 @@ function clearAll() {
       execFileSync('security', ['delete-generic-password', '-s', SERVICE, '-a', account],
         { stdio: ['ignore', 'ignore', 'ignore'] });
       cleared.push(`钥匙串:${account}`);
-    } catch (e) { /* 条目不存在:无需清除 */ }
+    } catch (e) { if (e.status !== 44) throw new Error('钥匙串条目清除失败，请检查钥匙串权限。'); }
   }
   for (const file of [TOKEN_FILE, CREDS_FILE]) {
     try {
       fs.unlinkSync(file);
       cleared.push(file);
-    } catch (e) { /* 不存在:无需清除 */ }
+    } catch (e) { if (e.code !== 'ENOENT') throw e; }
   }
   return cleared;
 }
