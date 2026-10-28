@@ -499,3 +499,71 @@ test('逐模型上限: 表里的值不会让"大 max_tokens"被压到撞墙', ()
       '客户端发 ' + sent + ' 被压成 ' + pl.max_tokens + ',仍会撞上游边界');
   }
 });
+// ---- normalizePayload: 对不支持 tool 的上游模型剥离 tool 字段 ----
+// 背景: 部分上游后端(如 DeepSeek-R1-W8A8)不实现 function/tool calling,
+// 收到 tools/tool_calls/tool 消息会抛 Python 异常(can only concatenate str
+// (not "dict") to str) 并以 502 透传给客户端。代理在转发前对这些模型做降级,
+// 剥离 tool 相关字段,避免上游崩溃。命中规则见 core/payload.js 的
+// PROXY_STRIP_TOOLS_FOR(缺省匹配含 "R1" 的模型名)。
+
+test('归一化: 默认规则 /R1/i 对 R1 系模型剥离 tool 相关字段', () => {
+  const p = {
+    model: 'DeepSeek-R1-W8A8',
+    messages: [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'f', arguments: '{}' } }] },
+      { role: 'tool', content: '20度', tool_call_id: 'c1' },
+    ],
+    tools: [{ type: 'function', function: { name: 'f' } }],
+    tool_choice: 'auto',
+    parallel_tool_calls: false,
+  };
+  const applied = normalizePayload(p, 'DeepSeek-R1-W8A8');
+  assert.strictEqual(p.tools, undefined);
+  assert.strictEqual(p.tool_choice, undefined);
+  assert.strictEqual(p.parallel_tool_calls, undefined);
+  // tool 消息被丢弃;assistant 的 tool_calls 被清掉
+  assert.strictEqual(p.messages.length, 2);
+  assert.strictEqual(p.messages[0].role, 'user');
+  assert.strictEqual(p.messages[1].role, 'assistant');
+  assert.ok(!('tool_calls' in p.messages[1]), 'assistant tool_calls 应被清除');
+  assert.ok(applied.some((n) => n.includes('strip-tools')), '应记录 strip 动作');
+});
+
+test('归一化: 非命中模型(如 V4.1)的 tool 字段原样保留', () => {
+  const p = {
+    model: 'DeepSeek-V4.1-Flash',
+    messages: [{ role: 'tool', content: '20度', tool_call_id: 'c1' }],
+    tools: [{ type: 'function', function: { name: 'f' } }],
+    tool_choice: 'auto',
+  };
+  normalizePayload(p, 'DeepSeek-V4.1-Flash');
+  assert.ok(Array.isArray(p.tools) && p.tools.length === 1);
+  assert.strictEqual(p.tool_choice, 'auto');
+  assert.strictEqual(p.messages.length, 1);
+  assert.strictEqual(p.messages[0].role, 'tool');
+});
+
+test('归一化: 自定义 PROXY_STRIP_TOOLS_FOR 可扩展命中其它模型', () => {
+  const prev = process.env.PROXY_STRIP_TOOLS_FOR;
+  process.env.PROXY_STRIP_TOOLS_FOR = 'qwen3.8-27b,/R1/i';
+  try {
+    const p = { model: 'qwen3.8-27b', messages: [{ role: 'user', content: 'hi' }], tools: [{ type: 'function', function: { name: 'f' } }] };
+    normalizePayload(p, 'qwen3.8-27b');
+    assert.strictEqual(p.tools, undefined, '自定义规则应剥离 qwen 的 tools');
+  } finally {
+    if (prev === undefined) delete process.env.PROXY_STRIP_TOOLS_FOR; else process.env.PROXY_STRIP_TOOLS_FOR = prev;
+  }
+});
+
+test('归一化: PROXY_STRIP_TOOLS_FOR 支持 * 通配', () => {
+  const prev = process.env.PROXY_STRIP_TOOLS_FOR;
+  process.env.PROXY_STRIP_TOOLS_FOR = 'DeepSeek-*';
+  try {
+    const p = { model: 'DeepSeek-R1-W8A8', messages: [{ role: 'user', content: 'hi' }], tools: [{}] };
+    normalizePayload(p, 'DeepSeek-R1-W8A8');
+    assert.strictEqual(p.tools, undefined, '通配规则应剥离 tools');
+  } finally {
+    if (prev === undefined) delete process.env.PROXY_STRIP_TOOLS_FOR; else process.env.PROXY_STRIP_TOOLS_FOR = prev;
+  }
+});

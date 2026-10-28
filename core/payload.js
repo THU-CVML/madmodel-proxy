@@ -64,6 +64,50 @@ function normalizePayload(payload, model, meta, maxOutputTokens) {
     if (payload.model !== undefined) applied.push('model=' + String(payload.model).slice(0, 40));
     payload.model = model;
   }
+
+  // 对不支持 tool calling 的上游模型(如 DeepSeek-R1-W8A8)在转发前剥离 tool 相关字段,
+  // 降级为纯文本对话,避免上游后端崩溃(can only concatenate str (not "dict") to str)。
+  // 命中规则:PROXY_STRIP_TOOLS_FOR(逗号分隔;支持 * 通配与 /regex/),缺省匹配含 "R1" 的模型名。
+  {
+    const _env = process.env.PROXY_STRIP_TOOLS_FOR;
+    const _patterns = (_env && _env.trim())
+      ? _env.split(',').map((x) => x.trim()).filter(Boolean)
+      : ['/R1/i'];
+    const _hit = _patterns.some((p) => {
+      if (typeof p === 'string' && p.startsWith('/')) {
+        const _ls = p.lastIndexOf('/');
+        if (_ls > 0) {
+          try { return new RegExp(p.slice(1, _ls), p.slice(_ls + 1) || 'i').test(model); } catch (_) { return false; }
+        }
+      }
+      if (p.includes('*')) {
+        const lead = p.startsWith('*'), trail = p.endsWith('*');
+        const core = p.replace(/\*/g, '').toLowerCase();
+        const m = String(model).toLowerCase();
+        if (lead && trail) return m.includes(core);
+        if (lead) return m.endsWith(core);
+        if (trail) return m.startsWith(core);
+        return m === core;
+      }
+      return p.toLowerCase() === String(model).toLowerCase();
+    });
+    if (_hit) {
+      for (const k of ['tools', 'tool_choice', 'parallel_tool_calls', 'functions', 'function_call']) {
+        if (payload[k] !== undefined) { delete payload[k]; applied.push(`-${k}`); }
+      }
+      if (Array.isArray(payload.messages)) {
+        const kept = [];
+        for (const m of payload.messages) {
+          if (!m || typeof m !== 'object') { kept.push(m); continue; }
+          if (m.role === 'tool') continue;
+          if (m.tool_calls) { delete m.tool_calls; }
+          kept.push(m);
+        }
+        payload.messages = kept;
+        applied.push('strip-tools(unsupported-model)');
+      }
+    }
+  }
   for (const key of UPSTREAM_REJECTED) {
     if (payload[key] !== undefined) {
       delete payload[key];
