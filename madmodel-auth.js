@@ -11,6 +11,8 @@
 'use strict';
 
 const crypto = require('crypto');
+const { WEBVPN_PREFIX, INFO_PREFIX, MADMODEL_VPN_PREFIX, MADMODEL_TUNNEL_MODELS_URL,
+  TUNNEL_COOKIE_SCOPE, jwtExpiresAt, generateFingerprint } = require('./core/auth-shared');
 
 // sm2.js(jsbn 系 RNG)的熵池播种(vendored 源码核实):window.crypto 分支只把
 // 32 字节 CSPRNG 写入 256 字节池的开头,其余 224 字节无条件由 Math.random 补齐,
@@ -58,7 +60,6 @@ try {
 
 // ===== 端点(实测于 2026-09,学校改版即失效) =====
 const ID_PREFIX = 'https://id.tsinghua.edu.cn';
-const WEBVPN_PREFIX = 'https://webvpn.tsinghua.edu.cn';
 const WEBVPN_OAUTH_LOGIN = () => `${WEBVPN_PREFIX}/login?oauth_login=true`;
 const ID_LOGIN_CHECK = () => `${ID_PREFIX}/do/off/ui/auth/login/check`;
 const ID_DOUBLE_AUTH = () => `${ID_PREFIX}/b/doubleAuth/login`;
@@ -71,21 +72,15 @@ const GET_COOKIE_URL = WEBVPN_PREFIX +
 // INFO_PREFIX / MADMODEL_VPN_PREFIX 末段的 HASH:hex(IV)+hex(AES-128-CFB(主机名)),
 // 密钥与 IV 同为 ASCII 口令 wrdvpnisthebest!(wengine 固定常量)。学校换主机名时
 // 按 test/tunnel-prefix.test.js 的 derive() 重新生成
-const INFO_PREFIX = WEBVPN_PREFIX +
-  '/https/77726476706e69737468656265737421f9f9479369247b59700f81b9991b2631506205de';
 const ROAMING_URL = `${INFO_PREFIX}/b/yyfw/vyyfwxx/info/portal_fg/common/onlineAppRedirect`;
-const MADMODEL_VPN_PREFIX = WEBVPN_PREFIX +
-  '/https/77726476706e69737468656265737421fdf6459128346d5c300b9ae28c462a3b27469fc32211fa26a3e464';
 const MADMODEL_AUTH_CHECK_URL = `${MADMODEL_VPN_PREFIX}/model-api/auth-login/check?ticket=`;
 // madmodel 隧道内 models 地址:登录期会话判定(verifyWebVpnSession)与 config.js
 // 保活探测(keepaliveUrl)共用的探测目标——单一来源,防两处路径漂移后
 // "登录判定与保活探的不是同一条路径"的静默错位
-const MADMODEL_TUNNEL_MODELS_URL = `${MADMODEL_VPN_PREFIX}/v1/models`;
 // 取隧道 cookie 的作用域。**必须是隧道前缀**(而非 webvpn 域根):隧道的会话
 // cookie 可能设在 Path=/https/<hash> 这种深路径上,按根路径匹配会漏掉它;
 // 按隧道前缀匹配同时也排除同域其他应用(如 info 门户)的 cookie。
 // 导出给上游与会话探测共用此常量,防两处各写一个 URL 后悄悄漂开
-const TUNNEL_COOKIE_SCOPE = `${MADMODEL_VPN_PREFIX}/`;
 // madmodel 应用在 info 门户的漫游 ID(门户页面里的 yyfwid 参数值)
 const MADMODEL_ROAMING_ID = '19D04E39D96B36C494F2E48A1A4741FD';
 
@@ -363,6 +358,9 @@ async function requestWithRedirects(options, jar, maxRedirects = 16) {
 
     const redirect = res.headers.get('location');
     if (res.status >= 300 && res.status < 400 && redirect) {
+      // 每一条重定向出口都丢弃响应体，包括跳数超限、地址非法和目标被拒绝。
+      // 不等到校验成功后才取消，否则失败的认证链会把连接留到超时或 GC。
+      try { await res.body?.cancel(); } catch (e) { /* 已结束/无 body */ }
       if (hops >= maxRedirects) {
         const err = new Error('重定向次数过多');
         err.code = 'TOO_MANY_REDIRECTS';
@@ -381,10 +379,6 @@ async function requestWithRedirects(options, jar, maxRedirects = 16) {
         method = 'GET';
         data = null;
       }
-      // 丢弃这一跳的响应体:重定向响应不需要读,但不 cancel 会让连接挂到 GC
-      // 才释放——登录链一跳一次,watch 长跑下会累积占用连接池
-      // (2026-09-22 审阅指出)
-      try { await res.body?.cancel(); } catch (e) { /* 已结束/无 body */ }
       continue;
     }
     const buf = await readBodyLimited(res);
@@ -861,21 +855,6 @@ class MadmodelAuthClient {
       cookie: this.jar.headerFor(TUNNEL_COOKIE_SCOPE),
     };
   }
-}
-
-// JWT exp 解码(payload 第二段 base64url);解析失败返回 now+5h 兜底。
-function jwtExpiresAt(token) {
-  try {
-    const parts = token.split('.');
-    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
-    if (payload && Number.isFinite(payload.exp)) return payload.exp * 1000;
-  } catch (e) { /* fallthrough */ }
-  return Date.now() + 5 * 3600 * 1000;
-}
-
-// 复刻 learnX 的指纹形态:32 个十六进制字符(16 字节)
-function generateFingerprint() {
-  return crypto.randomBytes(16).toString('hex');
 }
 
 // 探活 HTTP 状态码 → verdict 的纯判定(独立导出便于离线测试;网络层错误由

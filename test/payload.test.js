@@ -5,7 +5,8 @@ require('../scripts/isolated-env').isolate();
 
 const test = require('node:test');
 const assert = require('node:assert');
-const { parseJsonBody, normalizePayload, fitTokenBudget, CONTEXT_RESERVE_TOKENS } = require('../core/payload');
+const { parseJsonBody, normalizePayload, fitTokenBudget, estimatePromptBudget,
+  CONTEXT_RESERVE_TOKENS } = require('../core/payload');
 
 const MODEL = 'DeepSeek-V4-Flash-0731';
 
@@ -17,6 +18,30 @@ test('parseJsonBody: 合法 JSON 对象返回原对象', () => {
 
 test('parseJsonBody: 非 JSON 抛 INVALID_JSON', () => {
   assert.throws(() => parseJsonBody(Buffer.from('not json')), e => e.code === 'INVALID_JSON');
+});
+
+test('parseJsonBody: 非法 UTF-8 不会替换后转发为合法对话', () => {
+  const invalidBodies = [
+    Buffer.concat([Buffer.from('{"messages":[{"content":"'), Buffer.from([0xff]), Buffer.from('"}]}')]),
+    Buffer.concat([Buffer.from('{"content":"'), Buffer.from([0xe4, 0xbd])]),
+  ];
+  for (const body of invalidBodies) {
+    assert.throws(() => parseJsonBody(body), e => e.code === 'INVALID_UTF8' && /UTF-8/.test(e.message));
+  }
+  const valid = { content: '中文与 emoji 😀、客户端实际写入的替换字符 �' };
+  assert.deepStrictEqual(parseJsonBody(Buffer.from(JSON.stringify(valid))), valid);
+});
+
+test('parseJsonBody: 解析错误不回显请求正文，仅保留类别与位置', () => {
+  const marker = 'PRIVATE-PROMPT-CONTENT';
+  for (const source of [marker, `"${marker}" trailing`, `{"content":"${marker}`]) {
+    assert.throws(() => parseJsonBody(Buffer.from(source)), e => {
+      assert.strictEqual(e.code, 'INVALID_JSON');
+      assert.ok(!e.message.includes(marker));
+      assert.match(e.message, /^请求体不是合法 JSON: (语法无效|字符串未闭合|内容未完成)(（位置 \d+）)?$/);
+      return true;
+    });
+  }
 });
 
 test('parseJsonBody: 数组/null/标量抛 INVALID_PAYLOAD', () => {
@@ -42,7 +67,7 @@ test('归一化: 调用方给的模型被如实应用(不再固定换成 config.
   assert.strictEqual(q.model, 'qwen3.8-27b');
 });
 
-test('归一化: model 缺省时注入默认值(上游拒绝空 model)', () => {
+test('归一化: 调用方显式提供模型时写入空 payload（不代表生产默认路由）', () => {
   const p = { messages: [] };
   const applied = normalizePayload(p, MODEL);
   assert.strictEqual(p.model, MODEL);
@@ -278,7 +303,7 @@ test('思考方言: 原生 enable_thinking=false 也被识别为关闭', () => {
   assert.ok(!('enable_thinking' in p));
 });
 
-// ---- fitTokenBudget:预检门的精确收缩(上游规则 prompt+max_tokens ≤ 262,144) ----
+// ---- fitTokenBudget:文本预算预检与输出收缩 ----
 test('预算适配: 未超限不改不注记', () => {
   const p = { max_tokens: 4096 };
   const r = fitTokenBudget(100000, p, 262144);
@@ -307,8 +332,7 @@ test('预算适配: 剩余空间 <512 判 413(prompt 本身超限)', () => {
   const p = { max_tokens: 65536 };
   const r = fitTokenBudget(262000, p, 262144);
   assert.strictEqual(r.ok, false);
-  assert.ok(r.message.includes('262000'));
-  assert.ok(r.message.includes('512'));
+  assert.strictEqual(r.message, '对话内容过长，请缩短对话或新建会话后重试。');
 });
 
 test('预算适配: max_tokens 缺省且 prompt 未超限 → 不注入不收缩', () => {
@@ -440,7 +464,7 @@ test('预算适配: 工具多到放不下最小预算时仍判 413', () => {
   const p = { max_tokens: 100, tools: toolsN(33) };
   const r = fitTokenBudget(262000, p, 262144);
   assert.strictEqual(r.ok, false);
-  assert.ok(r.message.includes('上下文上限'));
+  assert.ok(r.message.includes('缩短对话'));
 });
 
 test('预算适配: TOOL_DEF_TOKENS 覆盖实测斜率上界', () => {
@@ -465,6 +489,106 @@ test('预算适配: DSH 的 57 工具历史请求不再超过真实上游窗口'
 // 恰好撞墙,请求必然失败(错误文案还误导成"上游忙")。
 // 实测边界(经代理逐值探测,本地 prompt=5 时):262103 ✅ / 262104 ❌
 const config = require('../config');
+
+test('Qwen 长文本校准样本的输出预算为实际输入保留空间', () => {
+  // 2026-10-10 合成英文长文本：本地 62,017，上游 70,917。
+  const limits = config.limitsFor('qwen3.8-27b');
+  const payload = { max_tokens: limits.maxOutputTokens };
+  const budget = estimatePromptBudget(payload, 62017, limits.promptTokenMarginRatio);
+  assert.strictEqual(fitTokenBudget(62017, payload, limits.contextWindow, budget).ok, true);
+  assert.ok(70917 + payload.max_tokens < limits.contextWindow);
+  assert.ok(payload.max_tokens > 180000, '只收缩估算余量，不设置固定的小输出上限');
+
+  const ds = { max_tokens: 1048576 };
+  const dsLimits = config.limitsFor('DeepSeek-V4.1-Flash');
+  const dsBudget = estimatePromptBudget(ds, 62017, dsLimits.promptTokenMarginRatio);
+  fitTokenBudget(62017, ds, dsLimits.contextWindow, dsBudget);
+  assert.strictEqual(ds.max_tokens, 1048576 - 62017 - CONTEXT_RESERVE_TOKENS);
+});
+
+test('未知图片只占软预算，不改变文本硬余量或注入缺省输出', () => {
+  const text = { max_tokens: 262000, messages: [{ role: 'user', content: 'hi' }] };
+  const images = { max_tokens: 262000, messages: [{ role: 'user', content: [
+    { type: 'text', text: 'hi' },
+    { type: 'image_url', image_url: { url: 'data:image/png;base64,fixture' } },
+    { type: 'image_url', image_url: { url: 'https://example.invalid/image.png' } },
+  ] }] };
+  const textBudget = estimatePromptBudget(text), imageBudget = estimatePromptBudget(images);
+  assert.strictEqual(textBudget.reserveTokens, CONTEXT_RESERVE_TOKENS);
+  assert.strictEqual(imageBudget.reserveTokens, textBudget.reserveTokens);
+  assert.strictEqual(imageBudget.imageTokensEstimate, 32768);
+  assert.strictEqual(imageBudget.unknownImageCount, 2);
+  const fitted = fitTokenBudget(21, images, 262144);
+  assert.strictEqual(fitted.ok, true);
+  fitTokenBudget(21, text, 262144);
+  assert.strictEqual(images.max_tokens, text.max_tokens - 32768);
+  assert.strictEqual(images.max_tokens, 262144 - 21 - CONTEXT_RESERVE_TOKENS - 32768);
+  delete images.max_tokens;
+  assert.strictEqual(fitTokenBudget(21, images, 262144).ok, true);
+  assert.ok(!Object.hasOwn(images, 'max_tokens'));
+});
+
+// Valid synthetic 910×1287 grayscale PNG, matching the dimensions in issue #7.
+const screenshot = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAA44AAAUHAQAAAAA94wETAAAApklEQVR4nO3BAQ0AAADCoPdPbQ43oAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAuDFCQwABfEkFbwAAAABJRU5ErkJggg==';
+function imageMessages(count) {
+  return [{ role: 'user', content: Array.from({ length: count }, () => ({
+    type: 'image_url', image_url: { url: screenshot },
+  })) }];
+}
+
+test('图片公式与软余量独立于工具、模板和文本硬余量', () => {
+  const budget = estimatePromptBudget({ model: 'DeepSeek-V4.1-Flash',
+    tools: toolsN(33), messages: imageMessages(2) }, 101, 0.15);
+  assert.deepStrictEqual(budget, { baseReserveTokens: 1024, toolReserveTokens: 660,
+    marginTokens: 16, reserveTokens: 1700, imageCount: 2, imageTokensEstimate: 1430,
+    imageMarginTokens: 16, dimensionImageCount: 2, unknownImageCount: 0, imageEstimateSource: 'dimensions' });
+});
+
+test('issue #7：430066 文本 token、49 个工具和40张截图不再被图片预留误拒', () => {
+  const payload = { model: 'DeepSeek-V4.1-Flash', max_tokens: 1048576,
+    tools: toolsN(49), messages: imageMessages(40) };
+  const before = JSON.stringify(payload.messages);
+  const budget = estimatePromptBudget(payload, 430066);
+  assert.strictEqual(budget.reserveTokens, 2004);
+  assert.strictEqual(budget.imageTokensEstimate, 28600);
+  assert.strictEqual(budget.imageMarginTokens, 320);
+  assert.strictEqual(fitTokenBudget(430066, payload, 1048576, budget).ok, true);
+  assert.strictEqual(payload.max_tokens, 587586);
+  assert.strictEqual(JSON.stringify(payload.messages), before, '图片内容完整保留');
+});
+
+test('63 张图现场回归：104394 文本 token 与 33 个工具不再因图片估值被拒绝', () => {
+  const payload = { max_tokens: 384000, tools: toolsN(33), messages: imageMessages(63) };
+  const budget = estimatePromptBudget(payload, 104394);
+  assert.strictEqual(budget.reserveTokens, 1684);
+  const fitted = fitTokenBudget(104394, payload, 1048576, budget);
+  assert.strictEqual(fitted.ok, true);
+  assert.strictEqual(payload.max_tokens, 384000);
+});
+
+test('64 张图不注入缺省预算，也不提高显式小预算', () => {
+  for (const extra of [{}, { max_tokens: 4096 }, { max_tokens: 16, thinking: false }]) {
+    const payload = { messages: imageMessages(64), ...extra };
+    const fitted = fitTokenBudget(21, payload, 1048576);
+    assert.strictEqual(fitted.ok, true);
+    assert.strictEqual(payload.max_tokens, extra.max_tokens);
+    assert.strictEqual(Object.hasOwn(payload, 'max_tokens'), Object.hasOwn(extra, 'max_tokens'));
+  }
+});
+
+test('含图请求仍按文字和工具收缩；文字本身超限仍拒绝', () => {
+  const context = 32768;
+  const payload = { messages: imageMessages(1), tools: toolsN(33), max_tokens: 4096 };
+  const reserve = CONTEXT_RESERVE_TOKENS + 33 * TOOL_DEF_TOKENS;
+  const fitted = fitTokenBudget(context - reserve - 1000, payload, context);
+  assert.strictEqual(fitted.ok, true);
+  assert.strictEqual(payload.max_tokens, 1000);
+  for (const off of [false, true]) {
+    const rejected = { ...payload, max_tokens: 4096, thinking: !off };
+    const room = off ? 0 : 511;
+    assert.strictEqual(fitTokenBudget(context - reserve - room, rejected, context).ok, false);
+  }
+});
 
 test('逐模型上限: qwen 的值必须低于实测撞墙值 262104', () => {
   const lim = config.limitsFor('qwen3.8-27b');
@@ -499,71 +623,116 @@ test('逐模型上限: 表里的值不会让"大 max_tokens"被压到撞墙', ()
       '客户端发 ' + sent + ' 被压成 ' + pl.max_tokens + ',仍会撞上游边界');
   }
 });
-// ---- normalizePayload: 对不支持 tool 的上游模型剥离 tool 字段 ----
-// 背景: 部分上游后端(如 DeepSeek-R1-W8A8)不实现 function/tool calling,
-// 收到 tools/tool_calls/tool 消息会抛 Python 异常(can only concatenate str
-// (not "dict") to str) 并以 502 透传给客户端。代理在转发前对这些模型做降级,
-// 剥离 tool 相关字段,避免上游崩溃。命中规则见 core/payload.js 的
-// PROXY_STRIP_TOOLS_FOR(缺省匹配含 "R1" 的模型名)。
-
-test('归一化: 默认规则 /R1/i 对 R1 系模型剥离 tool 相关字段', () => {
-  const p = {
+// ---- 不支持原生工具调用的模型：普通聊天兼容与历史完整性 ----
+function r1ToolHistory(content = null) {
+  return {
     model: 'DeepSeek-R1-W8A8',
     messages: [
-      { role: 'user', content: 'hi' },
-      { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: 'f', arguments: '{}' } }] },
-      { role: 'tool', content: '20度', tool_call_id: 'c1' },
+      { role: 'user', content: 'Read the record.' },
+      { role: 'assistant', content, tool_calls: [
+        { id: 'c1', type: 'function', function: { name: 'read_record', arguments: '{}' } },
+      ] },
+      { role: 'tool', content: '{"verification_code":"573826"}', tool_call_id: 'c1' },
+      { role: 'user', content: 'What was the verification code?' },
     ],
-    tools: [{ type: 'function', function: { name: 'f' } }],
+    tools: [{ type: 'function', function: { name: 'read_record' } }],
     tool_choice: 'auto',
     parallel_tool_calls: false,
   };
-  const applied = normalizePayload(p, 'DeepSeek-R1-W8A8');
-  assert.strictEqual(p.tools, undefined);
-  assert.strictEqual(p.tool_choice, undefined);
-  assert.strictEqual(p.parallel_tool_calls, undefined);
-  // tool 消息被丢弃;assistant 的 tool_calls 被清掉
-  assert.strictEqual(p.messages.length, 2);
-  assert.strictEqual(p.messages[0].role, 'user');
-  assert.strictEqual(p.messages[1].role, 'assistant');
-  assert.ok(!('tool_calls' in p.messages[1]), 'assistant tool_calls 应被清除');
-  assert.ok(applied.some((n) => n.includes('strip-tools')), '应记录 strip 动作');
+}
+
+for (const content of [null, '', 'I will read the record.']) {
+  test('R1 普通聊天保留工具结果与 assistant 正文: ' + JSON.stringify(content), () => {
+    const p = r1ToolHistory(content);
+    const expected = structuredClone(p.messages);
+    delete expected[1].tool_calls;
+    normalizePayload(p, p.model);
+    assert.deepStrictEqual(p.messages, expected);
+    for (const key of ['tools', 'tool_choice', 'parallel_tool_calls']) {
+      assert.ok(!(key in p), key);
+    }
+  });
+}
+
+test('R1 保留多条工具结果的顺序、名称和调用 ID', () => {
+  const p = r1ToolHistory();
+  p.messages.splice(3, 0, { role: 'tool', tool_call_id: 'c2', name: 'read_file',
+    content: 'path=notes.txt\nThe second result must remain intact.' });
+  p.messages[1].tool_calls.push({ id: 'c2', type: 'function',
+    function: { name: 'read_file', arguments: '{"path":"notes.txt"}' } });
+  const expected = structuredClone(p.messages);
+  delete expected[1].tool_calls;
+  normalizePayload(p, p.model);
+  assert.deepStrictEqual(p.messages, expected);
 });
 
-test('归一化: 非命中模型(如 V4.1)的 tool 字段原样保留', () => {
-  const p = {
-    model: 'DeepSeek-V4.1-Flash',
-    messages: [{ role: 'tool', content: '20度', tool_call_id: 'c1' }],
-    tools: [{ type: 'function', function: { name: 'f' } }],
-    tool_choice: 'auto',
-  };
-  normalizePayload(p, 'DeepSeek-V4.1-Flash');
-  assert.ok(Array.isArray(p.tools) && p.tools.length === 1);
-  assert.strictEqual(p.tool_choice, 'auto');
-  assert.strictEqual(p.messages.length, 1);
-  assert.strictEqual(p.messages[0].role, 'tool');
+test('R1 旧式 function 历史也保留结果正文，只移除调用结构', () => {
+  const p = { model: 'DeepSeek-R1-W8A8', functions: [{ name: 'read_record' }],
+    function_call: 'auto', messages: [
+      { role: 'assistant', content: null, function_call: { name: 'read_record', arguments: '{}' } },
+      { role: 'function', name: 'read_record', content: 'record=573826' },
+    ] };
+  const expected = structuredClone(p.messages);
+  delete expected[0].function_call;
+  normalizePayload(p, p.model);
+  assert.deepStrictEqual(p.messages, expected);
+  assert.ok(!('functions' in p) && !('function_call' in p));
 });
 
-test('归一化: 自定义 PROXY_STRIP_TOOLS_FOR 可扩展命中其它模型', () => {
-  const prev = process.env.PROXY_STRIP_TOOLS_FOR;
-  process.env.PROXY_STRIP_TOOLS_FOR = 'qwen3.8-27b,/R1/i';
-  try {
-    const p = { model: 'qwen3.8-27b', messages: [{ role: 'user', content: 'hi' }], tools: [{ type: 'function', function: { name: 'f' } }] };
-    normalizePayload(p, 'qwen3.8-27b');
-    assert.strictEqual(p.tools, undefined, '自定义规则应剥离 qwen 的 tools');
-  } finally {
-    if (prev === undefined) delete process.env.PROXY_STRIP_TOOLS_FOR; else process.env.PROXY_STRIP_TOOLS_FOR = prev;
+test('R1 普通聊天规则同样移除 required 和指定函数要求', () => {
+  for (const choice of ['required', { type: 'function', function: { name: 'read_record' } }]) {
+    const p = r1ToolHistory();
+    p.tool_choice = choice;
+    normalizePayload(p, p.model);
+    assert.ok(!('tool_choice' in p) && !('tools' in p));
+    assert.strictEqual(p.messages[2].content, '{"verification_code":"573826"}');
   }
 });
 
-test('归一化: PROXY_STRIP_TOOLS_FOR 支持 * 通配', () => {
-  const prev = process.env.PROXY_STRIP_TOOLS_FOR;
-  process.env.PROXY_STRIP_TOOLS_FOR = 'DeepSeek-*';
-  try {
-    const p = { model: 'DeepSeek-R1-W8A8', messages: [{ role: 'user', content: 'hi' }], tools: [{}] };
-    normalizePayload(p, 'DeepSeek-R1-W8A8');
-    assert.strictEqual(p.tools, undefined, '通配规则应剥离 tools');
-  } finally {
-    if (prev === undefined) delete process.env.PROXY_STRIP_TOOLS_FOR; else process.env.PROXY_STRIP_TOOLS_FOR = prev;
+test('未命中模型的工具调用与历史保持完整', () => {
+  for (const model of ['DeepSeek-V4.1-Flash', 'qwen3.8-27b']) {
+    const p = r1ToolHistory();
+    p.model = model;
+    const expected = structuredClone(p);
+    normalizePayload(p, model);
+    assert.deepStrictEqual(p.messages, expected.messages);
+    assert.deepStrictEqual(p.tools, expected.tools);
+    assert.strictEqual(p.tool_choice, expected.tool_choice);
   }
+});
+
+test('R1 没有工具字段的普通聊天不产生剥离记录', () => {
+  const p = { model: 'DeepSeek-R1-W8A8', messages: [{ role: 'user', content: 'Hello' }] };
+  const expected = structuredClone(p);
+  assert.deepStrictEqual(normalizePayload(p, p.model), []);
+  assert.deepStrictEqual(p, expected);
+});
+
+test('模型规则支持精确名称、通配和有效正则，按配置快照应用', () => {
+  const { compileToolStripRules } = require('../core/tool-strip-rules');
+  for (const [pattern, model, strip] of [
+    [' qwen3.8-27b , /R1/i ', 'qwen3.8-27b', true],
+    ['deepseek-r1-w8a8', 'DeepSeek-R1-W8A8', true],
+    ['DeepSeek-*-W8A8', 'DeepSeek-R1-W8A8', true],
+    ['qwen3.8-*', 'qwen3x8-27b', false],
+    ['/R[0-9]{1,2}/i,qwen3.8-27b', 'qwen3.8-27b', true],
+    ['/[/,]R1/i,other', '/R1', true],
+    ['/R1\\/test/i,other', 'R1/test', true],
+    ['/r1/', 'DeepSeek-R1-W8A8', false],
+    ['/r1/ig', 'DeepSeek-R1-W8A8', true],
+    ['', 'DeepSeek-R1-W8A8', false],
+  ]) {
+    const rules = compileToolStripRules(pattern);
+    for (let i = 0; i < 2; i++) {
+      const p = { model, tools: [{}] };
+      normalizePayload(p, model, null, undefined, rules);
+      assert.strictEqual(!('tools' in p), strip, pattern);
+    }
+  }
+  for (const raw of ['/R1,other','/R1/z,other','/(/,other','/[abc/']) {
+    assert.throws(() => compileToolStripRules(raw), e => e.code === 'INVALID_TOOL_RULE');
+  }
+  const p = { model: 'Vendor1-Tool-Capable', tools: [{}] };
+  normalizePayload(p, p.model);
+  assert.ok(p.tools, '默认规则不能误伤名称含 r1 的其他模型');
 });
